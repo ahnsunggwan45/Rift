@@ -29,6 +29,7 @@ static GLOBAL_PROF: profiling::CountingAllocator = profiling::CountingAllocator;
 mod compression;
 mod config;
 mod console;
+mod control;
 mod crypto;
 mod downstream;
 mod framing;
@@ -169,6 +170,24 @@ async fn run(cfg: Arc<Config>) -> Result<()> {
 
     // Console commands (stdin). Exits silently on EOF when running in the background.
     console::spawn(registry.clone(), metrics.clone(), shutdown.clone());
+
+    // Out-of-band control channel (optional). Lets a trusted local backend (RiftSupport) trigger
+    // transfers/kicks without putting anything in the game stream — the basis for keeping the
+    // down-stream relay a pure pass-through (no scanning/decoding for TransferPackets).
+    match (cfg.control.addr.clone(), cfg.control.token.clone()) {
+        (Some(addr), Some(token)) => {
+            let reg = registry.clone();
+            tokio::spawn(async move {
+                if let Err(e) = control::serve(addr, token, reg).await {
+                    tracing::error!("control channel failed: {e}");
+                }
+            });
+        }
+        (Some(_), None) => {
+            tracing::warn!("control.addr set but control.token missing — control channel disabled");
+        }
+        _ => {}
+    }
 
     listener.listen().await;
     tracing::info!(

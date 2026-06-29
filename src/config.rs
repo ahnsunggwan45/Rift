@@ -26,6 +26,19 @@ pub struct Config {
     pub runtime: Runtime,
     #[serde(default)]
     pub metrics: MetricsCfg,
+    #[serde(default)]
+    pub control: ControlCfg,
+}
+
+/// Out-of-band control channel. A trusted local backend (e.g. the RiftSupport plugin) connects here to
+/// trigger seamless transfers, so the proxy never has to scan/decode the game stream for TransferPackets
+/// — the basis of the zero-decode fast path. Disabled unless `addr` is set.
+#[derive(Debug, Deserialize, Default)]
+pub struct ControlCfg {
+    /// TCP bind address (e.g. `"127.0.0.1:8090"`). Bind to localhost — the proxy and backends are co-located.
+    pub addr: Option<String>,
+    /// Shared token gating commands. Required when `addr` is set; commands without it are rejected.
+    pub token: Option<String>,
 }
 
 /// Runtime tuning. If `worker_threads` is unset, Tokio defaults to the number of logical cores.

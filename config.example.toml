@@ -43,6 +43,14 @@ log_interval_secs = 0          # >0 logs throughput and player count periodicall
 # history_file = "metrics.jsonl"
 # history_interval_secs = 10
 
+# Out-of-band control channel (optional). A trusted local backend (e.g. the RiftSupport plugin) connects
+# here to trigger seamless transfers/kicks WITHOUT sending a TransferPacket through the game stream —
+# so the proxy never has to scan/decode the down stream (zero-decode fast path). Bind to localhost.
+# Line protocol:  <token> transfer <name|xuid> <server>   /   <token> kick <name|xuid>
+# [control]
+# addr = "127.0.0.1:8090"
+# token = "change-me-shared-secret"
+
 # Downstream channels. Key = channel name (transfer target), address = backend server address (hostnames supported).
 [servers]
 lobby    = { address = "127.0.0.1:19133" }
