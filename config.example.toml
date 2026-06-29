@@ -35,6 +35,9 @@ force = false                  # true = 팩 거부 시 접속 불가
 log_interval_secs = 0          # >0 이면 주기적으로 throughput/인원 로그 출력
 # web_addr = "127.0.0.1:8080"  # 웹 대시보드 + /metrics·/players JSON.
                                # 주의: /players 는 이름·IP 노출 → 외부 공개 시 방화벽 뒤에 둘 것.
+# 성능 데이터 수집: 켜면 N초마다 메트릭 스냅샷을 JSONL 로 append. 나중에 이 파일을 받아 분석.
+# history_file = "metrics.jsonl"
+# history_interval_secs = 10
 
 # 다운스트림 채널. 키 = 채널 이름(transfer 대상), address = 실제 서버 주소(호스트네임 가능).
 [servers]

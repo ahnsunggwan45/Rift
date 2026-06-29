@@ -44,6 +44,13 @@ pub struct MetricsCfg {
     /// GET / 대시보드, GET /metrics·/players JSON 노출.
     #[serde(default)]
     pub web_addr: Option<String>,
+    /// 성능 데이터 수집용 — 지정하면 N초마다 메트릭 스냅샷을 이 파일에 JSONL 한 줄씩 append.
+    /// 실서버에서 켜두고 나중에 이 파일을 받아 시계열 분석(상황별 핫패스 판단)에 쓴다.
+    #[serde(default)]
+    pub history_file: Option<String>,
+    /// history 기록 간격(초). 0/미지정이면 10.
+    #[serde(default)]
+    pub history_interval_secs: u64,
 }
 
 /// 프록시 리소스팩 서빙 설정 (WDPE 방식 replace — 프록시가 packs/ 의 팩을 클라에 서빙,

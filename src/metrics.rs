@@ -221,4 +221,35 @@ impl Metrics {
             }
         });
     }
+
+    /// 성능 데이터 수집: interval 초마다 메트릭 스냅샷을 JSONL 한 줄씩 파일에 append.
+    /// 각 줄에 ts_ms(epoch) 포함 → 나중에 이 파일을 받아 시계열 분석(상황별 핫패스 판단)에 쓴다.
+    pub fn spawn_history(self: &Arc<Self>, path: String, interval_secs: u64) {
+        let interval = if interval_secs == 0 { 10 } else { interval_secs };
+        let m = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(interval));
+            loop {
+                tick.tick().await;
+                let ts_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let mut v = serde_json::to_value(m.snapshot()).unwrap_or_default();
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("ts_ms".to_string(), ts_ms.into());
+                }
+                if let Ok(line) = serde_json::to_string(&v) {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                    {
+                        let _ = writeln!(f, "{line}");
+                    }
+                }
+            }
+        });
+    }
 }

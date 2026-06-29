@@ -140,6 +140,11 @@ async fn run(cfg: Arc<Config>) -> Result<()> {
 
     let metrics = Arc::new(metrics::Metrics::default());
     metrics.spawn_logger(cfg.metrics.log_interval_secs);
+    // 성능 데이터 시계열 수집(선택). 실서버에서 켜두고 나중에 파일 받아 분석.
+    if let Some(hist) = &cfg.metrics.history_file {
+        metrics.spawn_history(hist.clone(), cfg.metrics.history_interval_secs);
+        tracing::info!(file = %hist, "메트릭 히스토리 기록 시작 (JSONL)");
+    }
 
     // 세션 레지스트리(콘솔/웹의 조회·조작 단일 출처) + 콘솔 stop 용 종료 신호.
     let registry = Arc::new(registry::Registry::default());
