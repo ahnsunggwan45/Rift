@@ -847,7 +847,9 @@ impl RaknetSocket {
 
     /// Send a packet
     ///
-    /// packet must be `0xfe` as the first byte, using other values of bytes may cause unexpected errors.
+    /// Sends a user payload. The transport is payload-agnostic — any application convention (e.g.
+    /// Minecraft's `0xfe` game-packet prefix) is the caller's concern, not RakNet's. Empty payloads
+    /// are rejected.
     ///
     /// Except Reliability::ReliableOrdered, all other reliability packets must be less than MTU - 60 (default 1340 bytes), otherwise RaknetError::PacketSizeExceedMTU will be returned
     ///
@@ -858,10 +860,6 @@ impl RaknetSocket {
     /// ```
     pub async fn send(&self, buf: &[u8], r: Reliability) -> Result<()> {
         if buf.is_empty() {
-            return Err(RaknetError::PacketHeaderError);
-        }
-
-        if buf[0] != 0xfe {
             return Err(RaknetError::PacketHeaderError);
         }
 
@@ -893,9 +891,6 @@ impl RaknetSocket {
     /// recv Bytes → send_bytes → frame slice).
     pub async fn send_bytes(&self, data: Bytes, r: Reliability) -> Result<()> {
         if data.is_empty() {
-            return Err(RaknetError::PacketHeaderError);
-        }
-        if data[0] != 0xfe {
             return Err(RaknetError::PacketHeaderError);
         }
         if self.close_notifier.is_closed() {
