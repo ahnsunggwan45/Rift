@@ -70,8 +70,45 @@ fn parse(pkt: &[u8]) -> Option<Identity> {
         }
     }
 
+    // 폴백: clientData JWT 의 ThirdPartyName (오프라인/신 포맷에서 표시 이름이 여기 있음).
+    if let Some(name) = client_data_name(cr, chain_end) {
+        return Some(Identity { name: Some(name), xuid: xuid_only });
+    }
     // 이름 못 찾음 — xuid 만이라도 있으면 반환(진단 로깅은 호출부 extract 에서 일괄 처리).
     xuid_only.map(|xuid| Identity { name: None, xuid: Some(xuid) })
+}
+
+/// connectionRequest 의 두 번째 블록(clientData JWT)에서 ThirdPartyName(표시 이름) 추출.
+/// 레이아웃: [LE u32 chainLen][chain][LE u32 clientDataLen][clientData JWT].
+fn client_data_name(cr: &[u8], chain_end: usize) -> Option<String> {
+    if chain_end + 4 > cr.len() {
+        return None;
+    }
+    let cd_len = u32::from_le_bytes([
+        cr[chain_end],
+        cr[chain_end + 1],
+        cr[chain_end + 2],
+        cr[chain_end + 3],
+    ]) as usize;
+    let cd_start = chain_end + 4;
+    let cd_end = cd_start.checked_add(cd_len)?;
+    if cd_end > cr.len() {
+        return None;
+    }
+    let jwt = std::str::from_utf8(&cr[cd_start..cd_end]).ok()?;
+    jwt_payload(jwt)?
+        .get("ThirdPartyName")
+        .and_then(|x| x.as_str())
+        .map(str::to_string)
+}
+
+/// JWT(header.payload.sig)의 payload(base64url)를 디코드해 JSON 으로.
+fn jwt_payload(token: &str) -> Option<serde_json::Value> {
+    let b64 = token.split('.').nth(1)?.trim_end_matches('=');
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(b64)
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// chain JWT 문자열들을 모은다. 알려진 포맷 모두 대응:
@@ -95,6 +132,12 @@ fn collect_chain_jwts(v: &serde_json::Value) -> Vec<String> {
             if let Some(c) = inner.get("chain").and_then(as_str_vec) {
                 return c;
             }
+        }
+    }
+    // 신 포맷(1.26.30): {"AuthenticationType":N, "Token":"<jwt>"} — 단일 토큰 JWT.
+    if let Some(tok) = v.get("Token").and_then(|t| t.as_str()) {
+        if !tok.is_empty() {
+            return vec![tok.to_string()];
         }
     }
     as_str_vec(v).unwrap_or_default()
@@ -225,5 +268,51 @@ mod tests {
         let id = extract(&synth_login(&chain));
         assert_eq!(id.name.as_deref(), Some("Alex"));
         assert_eq!(id.xuid.as_deref(), Some("9001"));
+    }
+
+    #[test]
+    fn extracts_displayname_from_token_format() {
+        // 1.26.30 신 포맷: {"AuthenticationType":N, "Token":"<jwt>"}, Token 의 extraData 에 이름.
+        let token = jwt_with(serde_json::json!({"displayName": "Jeb", "XUID": "7"}));
+        let chain = serde_json::json!({"AuthenticationType": 0, "Token": token}).to_string();
+        let id = extract(&synth_login(&chain));
+        assert_eq!(id.name.as_deref(), Some("Jeb"));
+        assert_eq!(id.xuid.as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn falls_back_to_clientdata_thirdpartyname() {
+        // Token 에 displayName 이 없으면(오프라인 등) clientData 의 ThirdPartyName 으로 폴백.
+        let token = jwt_with(serde_json::json!({"XUID": "5"})); // displayName 없음
+        let chain = serde_json::json!({"AuthenticationType": 0, "Token": token}).to_string();
+        let client_payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::json!({"ThirdPartyName": "Notch"}).to_string());
+        let client_jwt = format!("hdr.{client_payload}.sig");
+
+        // cr = [LE u32 chainLen][chain][LE u32 clientDataLen][clientData JWT]
+        let mut cr = Vec::new();
+        cr.extend_from_slice(&(chain.len() as u32).to_le_bytes());
+        cr.extend_from_slice(chain.as_bytes());
+        cr.extend_from_slice(&(client_jwt.len() as u32).to_le_bytes());
+        cr.extend_from_slice(client_jwt.as_bytes());
+
+        let mut pkt = vec![0x01u8, 0, 0, 0, 100]; // 헤더 + protocol
+        let mut len = cr.len() as u32;
+        loop {
+            let mut b = (len & 0x7f) as u8;
+            len >>= 7;
+            if len != 0 {
+                b |= 0x80;
+            }
+            pkt.push(b);
+            if len == 0 {
+                break;
+            }
+        }
+        pkt.extend_from_slice(&cr);
+
+        let id = extract(&pkt);
+        assert_eq!(id.name.as_deref(), Some("Notch"));
+        assert_eq!(id.xuid.as_deref(), Some("5"));
     }
 }
