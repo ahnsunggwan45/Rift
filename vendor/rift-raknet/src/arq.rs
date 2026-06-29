@@ -867,7 +867,12 @@ impl SendQ {
                     p.3 += 1;
                 }
             }
-            return ret;
+            // Rift: do NOT early-return here. The original code returned right after emitting
+            // resends, so newly-queued packets in self.packets were never sent while ANY
+            // reliable packet was still in flight (un-acked) — effectively stop-and-wait. That
+            // made per-packet latency scale with RTT, hitting high-ping players hardest. Fall
+            // through to the new-packet block so fresh packets go out in the same flush, after
+            // the resends already pushed above (order preserved).
         }
 
         if !self.packets.is_empty() {

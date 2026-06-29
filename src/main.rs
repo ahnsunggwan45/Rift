@@ -392,17 +392,18 @@ const DIM_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Waits for the client to confirm a dimension change (PlayerAction DIMENSION_CHANGE_ACK), draining
 /// and discarding other client packets meanwhile. Returns on the ack or after `timeout` — the
 /// transfer proceeds regardless, so a missing/late ack never freezes the player.
-async fn await_dim_change_ack(client: &RaknetSocket, compression_on: bool, timeout: Duration) {
-    let _ = tokio::time::timeout(timeout, async {
+async fn await_dim_change_ack(client: &RaknetSocket, compression_on: bool, timeout: Duration) -> bool {
+    tokio::time::timeout(timeout, async {
         loop {
             match client.recv().await {
-                Ok(data) if client_msg_is_dim_change_ack(data.as_ref(), compression_on) => return,
-                Ok(_) => {}       // ignore other client packets during the transfer
-                Err(_) => return, // client disconnected
+                Ok(data) if client_msg_is_dim_change_ack(data.as_ref(), compression_on) => return true,
+                Ok(_) => {}            // ignore other client packets during the transfer
+                Err(_) => return false, // client disconnected
             }
         }
     })
-    .await;
+    .await
+    .unwrap_or(false) // timed out → proceed anyway
 }
 
 /// True if a client game-packet message contains a PlayerAction(DIMENSION_CHANGE_ACK). Best-effort.
@@ -535,7 +536,8 @@ async fn do_transfer(
     // rushed through both dimension changes back-to-back and never fully re-initializes its render
     // state, leaving font glyph atlases half-loaded (custom unicode glyphs render blank on the new
     // server). Falls back after the timeout so a missing ack never hangs the transfer.
-    await_dim_change_ack(client, state.compression_on(), DIM_ACK_TIMEOUT).await;
+    let acked = await_dim_change_ack(client, state.compression_on(), DIM_ACK_TIMEOUT).await;
+    tracing::info!(acked, phase = "flip", %target, "transfer dimension-change ack");
 
     // Gamemode HUD sync: since StartGame is not forwarded to the client, the gamemode (health bar display, etc.)
     // would remain at the old server's value — explicitly notify the client of the new server's gamemode.
@@ -587,7 +589,8 @@ async fn do_transfer(
     // Wait for the client to confirm the final dimension change (now that it has real chunks) so it
     // fully re-initializes on the target world — and so this ack is consumed here rather than leaking
     // to the new downstream, which never sent a ChangeDimension. Falls back after the timeout.
-    await_dim_change_ack(client, state.compression_on(), DIM_ACK_TIMEOUT).await;
+    let acked = await_dim_change_ack(client, state.compression_on(), DIM_ACK_TIMEOUT).await;
+    tracing::info!(acked, phase = "target", %target, "transfer dimension-change ack");
 
     // Seed tracked state with the new server's initial boss bars/scoreboards/entities (for the next transfer teardown).
     state.seed_tracked(ready.bossbars, ready.objectives, ready.entities);

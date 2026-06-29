@@ -549,6 +549,29 @@ impl RaknetSocket {
                         }
                     }
 
+                    // Rift: if handle() queued any reply (ConnectedPong, handshake packets),
+                    // flush it immediately instead of letting it wait up to one 50 ms tick.
+                    // A tick-delayed ConnectedPong inflated the client's displayed ping by up to
+                    // ~50 ms — a big reason ping looked worse than on WaterdogPE. The read-lock
+                    // guard keeps the common game-data path (nothing queued) lock-light. ACK
+                    // batching is untouched (ACKs come from the tick loop via recvq, not sendq),
+                    // so the RakLib ipSec rate-limiter mitigation still holds.
+                    if sendq.read().await.get_reliable_queue_size() > 0 {
+                        let mut sendq = sendq.write().await;
+                        for f in sendq.flush(cur_timestamp_millis(), &peer_addr) {
+                            let data = f.serialize().unwrap();
+                            RaknetSocket::sendto(
+                                &s,
+                                &data,
+                                &peer_addr,
+                                enable_loss.load(Ordering::Relaxed),
+                                loss_rate.load(Ordering::Relaxed),
+                            )
+                            .await
+                            .unwrap();
+                        }
+                    }
+
                     // Rift patch: ACKs are NOT sent per-datagram here.
                     // Received sequence numbers accumulate in the recvq ackset and are
                     // batched into a single ACK every 50 ms by start_tick().
