@@ -93,6 +93,12 @@ impl SessionState {
         self.captured_login.as_deref()
     }
 
+    /// Whether batch compression is active (post-NetworkSettings). The transfer path needs this to
+    /// decode the client's packets while waiting for the dimension-change ack.
+    pub fn compression_on(&self) -> bool {
+        self.compression_on
+    }
+
     /// Drains and returns tracked boss bars, scoreboard objectives, and actor entities
     /// (used to tear down the previous server's state on transfer).
     pub fn take_tracked(&mut self) -> (Vec<i64>, Vec<String>, Vec<i64>) {

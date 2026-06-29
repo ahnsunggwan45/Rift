@@ -259,6 +259,15 @@ pub fn parse_remove_objective_name(pkt: &[u8]) -> Option<String> {
     read_string_at(pkt, hl)
 }
 
+/// Parses the action id from a PlayerActionPacket: `[header][actorRuntimeId UVarLong][action zigzag-VarInt]…`.
+/// Used to detect the client's DIMENSION_CHANGE_ACK during a transfer. Best-effort.
+pub fn parse_player_action(pkt: &[u8]) -> Option<i32> {
+    let (_, hl) = read_varint_u32(pkt).ok()?;
+    let (_rid, n) = read_varint_u64(pkt.get(hl..)?).ok()?;
+    let (action, _) = read_zigzag_i32(pkt.get(hl + n..)?).ok()?;
+    Some(action)
+}
+
 /// Reads the leading actorUniqueId (zigzag-VarLong) common to AddActor / AddItemActor / AddPainting
 /// / RemoveActor (each encodes it as the first field after the header). Used to track entities for
 /// teardown on transfer. Best-effort.
@@ -631,6 +640,13 @@ mod tests {
         assert_eq!(parse_actor_unique_id(&p).unwrap(), 123456789);
         // negative ids round-trip through zigzag too
         assert_eq!(parse_actor_unique_id(&remove_actor(-42)).unwrap(), -42);
+    }
+
+    #[test]
+    fn parse_player_action_reads_action() {
+        let p = player_action(1234, PLAYER_ACTION_DIMENSION_CHANGE_DONE);
+        assert_eq!(peek_packet_id(&p).unwrap(), ID_PLAYER_ACTION);
+        assert_eq!(parse_player_action(&p).unwrap(), PLAYER_ACTION_DIMENSION_CHANGE_DONE);
     }
 
     #[test]

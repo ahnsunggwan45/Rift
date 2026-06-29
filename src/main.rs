@@ -42,6 +42,7 @@ mod registry;
 mod web;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use rift_raknet::{RaknetListener, RaknetSocket, Reliability};
@@ -385,6 +386,51 @@ async fn send_pkt(sock: &RaknetSocket, pkt: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// How long to wait for the client's dimension-change ack before proceeding anyway (fallback).
+const DIM_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Waits for the client to confirm a dimension change (PlayerAction DIMENSION_CHANGE_ACK), draining
+/// and discarding other client packets meanwhile. Returns on the ack or after `timeout` — the
+/// transfer proceeds regardless, so a missing/late ack never freezes the player.
+async fn await_dim_change_ack(client: &RaknetSocket, compression_on: bool, timeout: Duration) {
+    let _ = tokio::time::timeout(timeout, async {
+        loop {
+            match client.recv().await {
+                Ok(data) if client_msg_is_dim_change_ack(data.as_ref(), compression_on) => return,
+                Ok(_) => {}       // ignore other client packets during the transfer
+                Err(_) => return, // client disconnected
+            }
+        }
+    })
+    .await;
+}
+
+/// True if a client game-packet message contains a PlayerAction(DIMENSION_CHANGE_ACK). Best-effort.
+fn client_msg_is_dim_change_ack(msg: &[u8], compression_on: bool) -> bool {
+    if msg.first() != Some(&0xfe) {
+        return false;
+    }
+    let payload = &msg[1..];
+    let (comp_type, batch_data) = if compression_on {
+        match payload.split_first() {
+            Some((&t, rest)) => (t, rest),
+            None => return false,
+        }
+    } else {
+        (crate::compression::NONE, payload)
+    };
+    let Ok(batch) = crate::compression::decompress(comp_type, batch_data) else {
+        return false;
+    };
+    let Ok(pkts) = crate::framing::split_batch(&batch) else {
+        return false;
+    };
+    pkts.iter().any(|p| {
+        crate::framing::peek_packet_id(p).ok() == Some(packets::ID_PLAYER_ACTION)
+            && packets::parse_player_action(p) == Some(packets::PLAYER_ACTION_DIMENSION_CHANGE_DONE)
+    })
+}
+
 /// Performs a transparent channel transfer (connect-before-disconnect). Ported from the Spectrum verification sequence.
 ///
 /// Key steps: ① Drive the new server (B) through **full spawn** rather than stopping at StartGame
@@ -472,11 +518,6 @@ async fn do_transfer(
 
     // (1) Play: flip to dummy dimension → client flushes old world (chunk/entity cache).
     send_pkt(client, &packets::change_dimension(flip_dim, pos, false)).await?;
-    send_pkt(
-        client,
-        &packets::player_action(runtime_id, packets::PLAYER_ACTION_DIMENSION_CHANGE_DONE),
-    )
-    .await?;
 
     // (2) Loading screen filler for the flip dimension: 9×9 empty chunks around the spawn chunk.
     for dx in -4..=4 {
@@ -488,6 +529,13 @@ async fn do_transfer(
             .await?;
         }
     }
+
+    // Wait for the client to confirm the flip dimension change (PlayerAction DIMENSION_CHANGE_ACK)
+    // before proceeding — same synchronization WaterdogPE/Spectrum use. Without it the client is
+    // rushed through both dimension changes back-to-back and never fully re-initializes its render
+    // state, leaving font glyph atlases half-loaded (custom unicode glyphs render blank on the new
+    // server). Falls back after the timeout so a missing ack never hangs the transfer.
+    await_dim_change_ack(client, state.compression_on(), DIM_ACK_TIMEOUT).await;
 
     // Gamemode HUD sync: since StartGame is not forwarded to the client, the gamemode (health bar display, etc.)
     // would remain at the old server's value — explicitly notify the client of the new server's gamemode.
@@ -525,21 +573,21 @@ async fn do_transfer(
     // (5) Clear: restore overworld + spawn.
     send_pkt(client, &packets::play_status(packets::PLAY_STATUS_PLAYER_SPAWN)).await?;
     send_pkt(client, &packets::change_dimension(final_dim, pos, true)).await?;
-    send_pkt(
-        client,
-        &packets::player_action(runtime_id, packets::PLAYER_ACTION_DIMENSION_CHANGE_DONE),
-    )
-    .await?;
     send_pkt(client, &packets::play_status(packets::PLAY_STATUS_PLAYER_SPAWN)).await?;
 
     // (6) Replay buffered real spawn stream (chunks/inventory/entities) — messages are already framed, send as-is.
-    //     The client is now in overworld and will accept chunks.
+    //     The client is now in overworld and will accept chunks (and needs them to finish this dimension change).
     for msg in &ready.spawn_buffer {
         client
             .send(msg, Reliability::ReliableOrdered)
             .await
             .map_err(|e| anyhow!("spawn stream replay failed: {e:?}"))?;
     }
+
+    // Wait for the client to confirm the final dimension change (now that it has real chunks) so it
+    // fully re-initializes on the target world — and so this ack is consumed here rather than leaking
+    // to the new downstream, which never sent a ChangeDimension. Falls back after the timeout.
+    await_dim_change_ack(client, state.compression_on(), DIM_ACK_TIMEOUT).await;
 
     // Seed tracked state with the new server's initial boss bars/scoreboards/entities (for the next transfer teardown).
     state.seed_tracked(ready.bossbars, ready.objectives, ready.entities);
