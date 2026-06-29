@@ -9,6 +9,30 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+/// Forward-latency histogram bucket upper bounds (μs); a final overflow bucket catches anything larger.
+const FWD_BUCKETS: [u64; 8] = [10, 25, 50, 100, 250, 500, 1000, 2500];
+
+/// Approximate p50/p95/p99 (μs) from the forward-latency histogram: the upper bound of the bucket where
+/// the cumulative count crosses each quantile (the overflow bucket reports the last bound as a floor).
+fn forward_percentiles(hist: &[u64]) -> (u64, u64, u64) {
+    let total: u64 = hist.iter().sum();
+    if total == 0 {
+        return (0, 0, 0);
+    }
+    let q = |num: u64| -> u64 {
+        let target = total * num / 100;
+        let mut cum = 0u64;
+        for (i, &c) in hist.iter().enumerate() {
+            cum += c;
+            if cum >= target {
+                return *FWD_BUCKETS.get(i).unwrap_or_else(|| FWD_BUCKETS.last().unwrap());
+            }
+        }
+        *FWD_BUCKETS.last().unwrap()
+    };
+    (q(50), q(95), q(99))
+}
+
 pub struct Metrics {
     /// Process start time (used to calculate uptime).
     start_time: Instant,
@@ -24,6 +48,9 @@ pub struct Metrics {
     /// Cumulative downstream forward processing time (ns) + count → average forward latency. Hot-path cost: two `Instant` calls (~tens of ns).
     fwd_ns_total: AtomicU64,
     fwd_count: AtomicU64,
+    /// Forward-latency histogram (bucketed μs) → p50/p95/p99 in the snapshot. Captures the distribution
+    /// the cumulative average hides (e.g. occasional chunk-decompress spikes). Hot-path cost: one atomic add.
+    fwd_hist: [AtomicU64; FWD_BUCKETS.len() + 1],
     /// Server name → current player count (driven by plist/monitoring).
     per_server: RwLock<HashMap<String, usize>>,
 }
@@ -43,6 +70,7 @@ impl Default for Metrics {
             transfers_failed: AtomicU64::new(0),
             fwd_ns_total: AtomicU64::new(0),
             fwd_count: AtomicU64::new(0),
+            fwd_hist: Default::default(),
             per_server: RwLock::new(HashMap::new()),
         }
     }
@@ -65,6 +93,10 @@ pub struct MetricsSnapshot {
     pub avg_packet_size_bytes: u64,
     /// Average downstream forward latency in μs. Typically a few to tens of μs; spikes signal downstream or contention issues.
     pub avg_forward_us: u64,
+    /// Forward-latency distribution (μs, bucket-approximate upper bound). p99 surfaces spikes the average hides.
+    pub forward_p50_us: u64,
+    pub forward_p95_us: u64,
+    pub forward_p99_us: u64,
     /// Cumulative allocation count/bytes. Non-zero only in profiling builds (`--features profiling`); zero otherwise.
     pub alloc_count: u64,
     pub alloc_bytes: u64,
@@ -99,8 +131,12 @@ impl Metrics {
     /// Records the processing time for one downstream forward (recv → client send complete) — used for average forward latency.
     #[inline]
     pub fn on_forward(&self, elapsed: std::time::Duration) {
-        self.fwd_ns_total.fetch_add(elapsed.as_nanos() as u64, Relaxed);
+        let ns = elapsed.as_nanos() as u64;
+        self.fwd_ns_total.fetch_add(ns, Relaxed);
         self.fwd_count.fetch_add(1, Relaxed);
+        let us = ns / 1000;
+        let idx = FWD_BUCKETS.iter().position(|&b| us < b).unwrap_or(FWD_BUCKETS.len());
+        self.fwd_hist[idx].fetch_add(1, Relaxed);
     }
 
     pub fn on_transfer(&self, from: &str, to: &str) {
@@ -140,6 +176,11 @@ impl Metrics {
         } else {
             0
         };
+        let mut hist = [0u64; FWD_BUCKETS.len() + 1];
+        for (i, h) in hist.iter_mut().enumerate() {
+            *h = self.fwd_hist[i].load(Relaxed);
+        }
+        let (forward_p50_us, forward_p95_us, forward_p99_us) = forward_percentiles(&hist);
         // Allocation counters are meaningful only in profiling builds; zero at runtime (counting allocator not installed).
         #[cfg(feature = "profiling")]
         let (alloc_count, alloc_bytes) = (
@@ -162,6 +203,9 @@ impl Metrics {
             msgs_down,
             avg_packet_size_bytes,
             avg_forward_us,
+            forward_p50_us,
+            forward_p95_us,
+            forward_p99_us,
             alloc_count,
             alloc_bytes,
             per_server: self.per_server_snapshot(),
