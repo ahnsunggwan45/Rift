@@ -767,6 +767,11 @@ impl SendQ {
         self.rto
     }
 
+    /// 평활화 왕복시간(SRTT, ms). RTO(50ms 하한)보다 실제 핑에 가깝다.
+    pub fn get_srtt(&self) -> i64 {
+        self.srtt
+    }
+
     pub fn nack(&mut self, sequence: u32, tick: i64) {
         for i in 0..self.sent_packet.len() {
             let item = &mut self.sent_packet[i];

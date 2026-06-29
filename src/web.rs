@@ -141,7 +141,7 @@ tr:last-child td{border-bottom:none}.num{text-align:right}.mut{color:var(--mut)}
   <h2>서버별 인원</h2>
   <table><thead><tr><th>서버</th><th class="num">인원</th></tr></thead><tbody id="servers"></tbody></table>
   <h2>접속자</h2>
-  <table><thead><tr><th>이름</th><th>IP</th><th>서버</th><th class="num">접속</th></tr></thead><tbody id="players"></tbody></table>
+  <table><thead><tr><th>이름</th><th>IP</th><th>서버</th><th class="num">핑</th><th class="num">접속</th></tr></thead><tbody id="players"></tbody></table>
   <p class="mut" id="err"></p>
 </div>
 <script>
@@ -170,7 +170,7 @@ async function tick(){
       document.getElementById('alloc').innerHTML=m.alloc_count.toLocaleString()+'<small> ('+Math.round(m.alloc_bytes/1048576)+' MiB)</small>';}
     const sv=Object.entries(m.per_server).sort((a,b)=>b[1]-a[1]);
     document.getElementById('servers').innerHTML=sv.length?sv.map(([k,v])=>`<tr><td>${k}</td><td class="num">${v}</td></tr>`).join(''):'<tr><td colspan=2 class="mut">없음</td></tr>';
-    document.getElementById('players').innerHTML=p.length?p.map(x=>`<tr><td>${x.name||'<span class=mut>?</span>'}</td><td class="mut">${x.peer}</td><td><span class="pill">${x.server}</span></td><td class="num mut">${fmtDur(x.connected_secs)}</td></tr>`).join(''):'<tr><td colspan=4 class="mut">없음</td></tr>';
+    document.getElementById('players').innerHTML=p.length?p.map(x=>`<tr><td>${x.name||'<span class=mut>?</span>'}</td><td class="mut">${x.peer}</td><td><span class="pill">${x.server}</span></td><td class="num">${x.rtt_ms?x.rtt_ms+'ms':'–'}</td><td class="num mut">${fmtDur(x.connected_secs)}</td></tr>`).join(''):'<tr><td colspan=5 class="mut">없음</td></tr>';
     document.getElementById('err').textContent='';
   }catch(e){document.getElementById('err').textContent='연결 끊김 — 재시도 중…';}
 }

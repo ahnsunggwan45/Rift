@@ -729,6 +729,11 @@ impl RaknetSocket {
         });
     }
 
+    /// 현재 추정 왕복시간(SRTT, ms). 핑 표시용 — 송신/ACK 왕복으로 갱신된다.
+    pub async fn rtt(&self) -> i64 {
+        self.sendq.read().await.get_srtt()
+    }
+
     /// Close Raknet Socket.
     /// Normally you don't need to call this method, the RaknetSocket will be closed automatically when it is released.
     /// This method can be called repeatedly.

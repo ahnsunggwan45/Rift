@@ -29,6 +29,7 @@ struct Entry {
     server: String,
     control: mpsc::Sender<Control>,
     connected: Instant,
+    rtt_ms: u32,
 }
 
 /// 웹 `/players` · 콘솔 `list` 직렬화용 세션 요약.
@@ -40,6 +41,8 @@ pub struct SessionInfo {
     pub server: String,
     /// 접속 후 경과 시간(초).
     pub connected_secs: u64,
+    /// 클라↔프록시 추정 RTT(ms, SRTT).
+    pub rtt_ms: u32,
 }
 
 #[derive(Default)]
@@ -53,7 +56,7 @@ impl Registry {
     pub fn register(&self, peer: SocketAddr, server: String, control: mpsc::Sender<Control>) -> u64 {
         let id = self.next_id.fetch_add(1, Relaxed);
         if let Ok(mut s) = self.sessions.write() {
-            s.insert(id, Entry { name: None, xuid: None, peer, server, control, connected: Instant::now() });
+            s.insert(id, Entry { name: None, xuid: None, peer, server, control, connected: Instant::now(), rtt_ms: 0 });
         }
         id
     }
@@ -81,6 +84,15 @@ impl Registry {
         }
     }
 
+    /// 주기적으로 측정한 클라↔프록시 RTT(ms) 갱신.
+    pub fn set_rtt(&self, id: u64, rtt_ms: u32) {
+        if let Ok(mut s) = self.sessions.write() {
+            if let Some(e) = s.get_mut(&id) {
+                e.rtt_ms = rtt_ms;
+            }
+        }
+    }
+
     pub fn remove(&self, id: u64) {
         if let Ok(mut s) = self.sessions.write() {
             s.remove(&id);
@@ -100,6 +112,7 @@ impl Registry {
                         peer: e.peer.to_string(),
                         server: e.server.clone(),
                         connected_secs: e.connected.elapsed().as_secs(),
+                        rtt_ms: e.rtt_ms,
                     })
                     .collect()
             })

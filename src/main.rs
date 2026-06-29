@@ -237,10 +237,16 @@ async fn relay(
     let (ctl_tx, mut ctl_rx) = tokio::sync::mpsc::channel::<registry::Control>(8);
     let session_id = registry.register(peer, current_server.clone(), ctl_tx);
     let mut identity_set = false;
+    // 주기적으로 클라↔프록시 RTT(핑)를 레지스트리에 갱신(웹/콘솔 표시용).
+    let mut rtt_tick = tokio::time::interval(std::time::Duration::from_secs(3));
 
     loop {
         let mut transfer_to: Option<String> = None;
         tokio::select! {
+            _ = rtt_tick.tick() => {
+                let rtt = client.rtt().await;
+                registry.set_rtt(session_id, rtt.max(0) as u32);
+            }
             cmd = ctl_rx.recv() => match cmd {
                 Some(registry::Control::Transfer(t)) => {
                     tracing::info!(session_id, target = %t, "콘솔 전환 요청");
