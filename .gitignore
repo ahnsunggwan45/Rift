@@ -14,3 +14,7 @@ dist-linux/rift.stripped
 dist-linux/rift-prof
 *.log
 *.jsonl
+
+# riftbench 빌드 산출물
+tools/riftbench/riftbench
+tools/riftbench/riftbench.exe
