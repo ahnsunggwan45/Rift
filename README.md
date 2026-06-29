@@ -54,11 +54,12 @@ Entity IDs are **not** rewritten. Instead, every server assigns the same player 
 
 ## Design principles
 
-- **Keep the fast path small** — decode only the few packets Rift must act on; forward everything else as raw bytes (no object creation, no parsing on the hot path).
-- **Zero unnecessary allocations / parsing** — uninteresting packet IDs are rejected by a single interest-bitmap lookup and passed straight through.
-- **Own the transport** — Rift vendors a patched RakNet fork ([`vendor/rift-raknet`](vendor/rift-raknet)), so the data path is tuned directly: copy-minimized framing, bounded fragment reassembly (DoS-resistant), reliable-packet de-duplication.
+- **Keep the fast path small** — the overwhelming majority of packets (movement, chunks, entity updates) are never decoded. Batches larger than a threshold are forwarded **opaquely** (no decompress, no decode, no allocation — the received `Bytes` are passed straight through); only the small batches that *can* carry a packet Rift acts on (transfer, entity Add/Remove, resource-pack) are decompressed and peeked via a single interest-bitmap lookup.
+- **Layer boundary: RakNet is transport-only** — `vendor/rift-raknet` knows nothing about Minecraft (no `0xfe`/game-packet assumptions); it moves opaque payloads with reliability/ordering/ACK. The Minecraft packet layer and all interception live in the proxy (`src/intercept.rs`, `src/packets.rs`). `UDP → RakNet → Minecraft packet layer → intercept`.
+- **Zero-copy forward, verifiable** — `recv()` yields `Bytes`; the fast path forwards them with `send_bytes()` (ref-counted slice, no copy, no clone). Only the slow path (a packet Rift rewrites) allocates. A `--features profiling` build exposes `alloc_count`/`alloc_bytes` at `/metrics` so the zero-allocation hot path is *checkable*, not just claimed.
+- **Own the transport** — the vendored RakNet fork is tuned directly: copy-minimized framing, bounded fragment reassembly (DoS-resistant), reliable-packet de-duplication, configurable ACK tick.
 - **PMMP-first** — the transfer model and deterministic entity-ID scheme are built around PocketMine-MP.
-- **Measure, then optimize** — metrics first; heavier work (pooling, worker-sharding, io_uring) only after real-server measurement. Predictable latency over feature bloat.
+- **Measure, then optimize** — metrics first: throughput, **forward-latency histogram (p50/p95/p99)**, allocation counters, JSONL time-series, and a [load tester](tools/riftbench). Heavier work (pooling, worker-sharding, io_uring) only after real-server measurement. Predictable latency over feature bloat.
 
 ## Requirements
 
