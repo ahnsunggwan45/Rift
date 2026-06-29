@@ -391,6 +391,10 @@ async fn send_pkt(sock: &RaknetSocket, pkt: &[u8]) -> Result<()> {
 /// within this and the wait returns immediately.
 const DIM_ACK_TIMEOUT: Duration = Duration::from_millis(1500);
 
+/// NetworkChunkPublisherUpdate radius sent during a transfer dimension change (mirrors WaterdogPE's
+/// small value — the filler chunks cover it, so the client finalizes the transition immediately).
+const CHUNK_PUBLISH_RADIUS: u32 = 3;
+
 /// Waits for the client to confirm a dimension change (PlayerAction DIMENSION_CHANGE_ACK), draining
 /// and discarding other client packets meanwhile. Returns on the ack or after `timeout` — the
 /// transfer proceeds regardless, so a missing/late ack never freezes the player.
@@ -531,12 +535,15 @@ async fn do_transfer(
     // chunk parse during the transition and destabilizes the client renderer (glyph/HUD glitches).
     let empty = packets::empty_chunk_payload(packets::dimension_biome_sections(flip_dim));
 
-    // (1) Play: flip to dummy dimension → client flushes old world (chunk/entity cache).
-    send_pkt(client, &packets::change_dimension(flip_dim, pos, false)).await?;
-
-    // (2) Loading screen filler for the flip dimension: 9×9 empty chunks around the spawn chunk.
-    for dx in -4..=4 {
-        for dz in -4..=4 {
+    // (1) Flip to the dummy dimension — full WaterdogPE injectDimensionChange sequence so the client
+    //     actually COMPLETES the transition (and re-initializes its render state, incl. font glyph
+    //     atlases). The previously-missing NetworkChunkPublisherUpdate + the server-sent
+    //     DIMENSION_CHANGE_ACK PlayerAction are what let the client finish; without them it stays
+    //     half-transitioned and custom unicode glyphs render blank on the new server.
+    send_pkt(client, &packets::change_dimension(flip_dim, pos, true)).await?;
+    send_pkt(client, &packets::network_chunk_publisher_update(pos, CHUNK_PUBLISH_RADIUS)).await?;
+    for dx in -3..=3 {
+        for dz in -3..=3 {
             send_pkt(
                 client,
                 &packets::level_chunk(spawn_cx + dx, spawn_cz + dz, flip_dim, 1, &empty),
@@ -544,12 +551,16 @@ async fn do_transfer(
             .await?;
         }
     }
+    // Force the client out of the dimension loading screen, then the Mojang-quirk server-side ACK.
+    send_pkt(client, &packets::play_status(packets::PLAY_STATUS_PLAYER_SPAWN)).await?;
+    send_pkt(
+        client,
+        &packets::player_action(runtime_id, packets::PLAYER_ACTION_DIMENSION_CHANGE_DONE),
+    )
+    .await?;
 
-    // Wait for the client to confirm the flip dimension change (PlayerAction DIMENSION_CHANGE_ACK)
-    // before proceeding — same synchronization WaterdogPE/Spectrum use. Without it the client is
-    // rushed through both dimension changes back-to-back and never fully re-initializes its render
-    // state, leaving font glyph atlases half-loaded (custom unicode glyphs render blank on the new
-    // server). Falls back after the timeout so a missing ack never hangs the transfer.
+    // Wait for the client to confirm the flip completed (its own DIMENSION_CHANGE_ACK), then proceed.
+    // Falls back after the timeout so a missing ack never hangs the transfer.
     let acked = await_dim_change_ack(client, state.compression_on(), DIM_ACK_TIMEOUT).await;
     tracing::info!(acked, phase = "flip", %target, "transfer dimension-change ack");
 
@@ -586,19 +597,25 @@ async fn do_transfer(
     // (4) DoSpawn → B: triggers doFirstSpawn (entity/chunk streaming).
     send_pkt(server, &packets::set_local_player_as_initialized(runtime_id)).await?;
 
-    // (5) Clear: restore overworld + spawn.
-    send_pkt(client, &packets::play_status(packets::PLAY_STATUS_PLAYER_SPAWN)).await?;
+    // (5) Restore the real (target) dimension — same full sequence: ChangeDimension →
+    //     ChunkPublisherUpdate → real chunks (B's spawn buffer) → PlayStatus → server-side ACK.
     send_pkt(client, &packets::change_dimension(final_dim, pos, true)).await?;
-    send_pkt(client, &packets::play_status(packets::PLAY_STATUS_PLAYER_SPAWN)).await?;
+    send_pkt(client, &packets::network_chunk_publisher_update(pos, CHUNK_PUBLISH_RADIUS)).await?;
 
     // (6) Replay buffered real spawn stream (chunks/inventory/entities) — messages are already framed, send as-is.
-    //     The client is now in overworld and will accept chunks (and needs them to finish this dimension change).
+    //     The client is now in the target dimension and will accept these chunks.
     for msg in &ready.spawn_buffer {
         client
             .send(msg, Reliability::ReliableOrdered)
             .await
             .map_err(|e| anyhow!("spawn stream replay failed: {e:?}"))?;
     }
+    send_pkt(client, &packets::play_status(packets::PLAY_STATUS_PLAYER_SPAWN)).await?;
+    send_pkt(
+        client,
+        &packets::player_action(runtime_id, packets::PLAYER_ACTION_DIMENSION_CHANGE_DONE),
+    )
+    .await?;
 
     // Wait for the client to confirm the final dimension change (now that it has real chunks) so it
     // fully re-initializes on the target world — and so this ack is consumed here rather than leaking

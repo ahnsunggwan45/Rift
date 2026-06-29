@@ -36,6 +36,7 @@ pub const ID_ADD_ACTOR: u32 = 0x0d;
 pub const ID_REMOVE_ACTOR: u32 = 0x0e;
 pub const ID_ADD_ITEM_ACTOR: u32 = 0x0f;
 pub const ID_ADD_PAINTING: u32 = 0x16;
+pub const ID_NETWORK_CHUNK_PUBLISHER_UPDATE: u32 = 0x79;
 
 // GameRuleType.
 const GAMERULE_TYPE_BOOL: u32 = 1;
@@ -136,6 +137,21 @@ pub fn change_dimension(dimension: i32, pos: [f32; 3], respawn: bool) -> Vec<u8>
     }
     p.push(respawn as u8);
     p.push(0x00); // loadingScreenId: optional, none
+    p
+}
+
+/// NetworkChunkPublisherUpdatePacket: `[header][blockPos: x zigzag, y uvarint, z zigzag][radius uvarint][savedChunks count: LE u32 = 0]`.
+/// Tells the client which chunks are published around a position so it can FINISH a dimension change.
+/// Without it the client never completes the transition (no DIMENSION_CHANGE_ACK) and its render state —
+/// including font glyph atlases — stays stale on the new server. (Mirrors WDPE injectChunkPublisherUpdate.)
+pub fn network_chunk_publisher_update(pos: [f32; 3], radius: u32) -> Vec<u8> {
+    let mut p = Vec::new();
+    write_varint_u32(ID_NETWORK_CHUNK_PUBLISHER_UPDATE, &mut p);
+    write_zigzag_i32(pos[0].floor() as i32, &mut p); // blockPos x (signed)
+    write_varint_u32(pos[1].max(0.0).floor() as u32, &mut p); // blockPos y (unsigned)
+    write_zigzag_i32(pos[2].floor() as i32, &mut p); // blockPos z (signed)
+    write_varint_u32(radius, &mut p); // radius
+    p.extend_from_slice(&0u32.to_le_bytes()); // savedChunks count (LE u32) = 0
     p
 }
 
@@ -640,6 +656,24 @@ mod tests {
         assert_eq!(parse_actor_unique_id(&p).unwrap(), 123456789);
         // negative ids round-trip through zigzag too
         assert_eq!(parse_actor_unique_id(&remove_actor(-42)).unwrap(), -42);
+    }
+
+    #[test]
+    fn network_chunk_publisher_update_format() {
+        let p = network_chunk_publisher_update([100.0, 64.0, -200.0], 3);
+        assert_eq!(peek_packet_id(&p).unwrap(), ID_NETWORK_CHUNK_PUBLISHER_UPDATE);
+        let (_, hl) = read_varint_u32(&p).unwrap();
+        let mut off = hl;
+        let (x, n) = read_zigzag_i32(&p[off..]).unwrap();
+        off += n;
+        let (y, n) = read_varint_u64(&p[off..]).unwrap();
+        off += n;
+        let (z, n) = read_zigzag_i32(&p[off..]).unwrap();
+        off += n;
+        let (r, n) = read_varint_u32(&p[off..]).unwrap();
+        off += n;
+        assert_eq!((x, y as i64, z, r), (100, 64, -200, 3));
+        assert_eq!(&p[off..off + 4], &0u32.to_le_bytes()); // savedChunks = 0
     }
 
     #[test]
