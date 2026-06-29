@@ -55,6 +55,10 @@ const DOWN_INTEREST: [bool; 256] = interest(&[
     packets::ID_BOSS_EVENT,
     packets::ID_SET_DISPLAY_OBJECTIVE,
     packets::ID_REMOVE_OBJECTIVE,
+    packets::ID_ADD_ACTOR,
+    packets::ID_ADD_ITEM_ACTOR,
+    packets::ID_ADD_PAINTING,
+    packets::ID_REMOVE_ACTOR,
 ]);
 
 /// While watching for transfers (after VV is done), batches larger than this (in bytes) are not
@@ -74,6 +78,9 @@ pub struct SessionState {
     bossbars: HashSet<i64>,
     /// Scoreboard objective names raised by the current server. Cleaned up with RemoveObjective on transfer.
     objectives: HashSet<String>,
+    /// Actor entities (mobs/NPCs/items/paintings) spawned by the current server, keyed by actorUniqueId.
+    /// Despawned with RemoveActor on transfer — the dimension flip alone does not reliably clear them.
+    entities: HashSet<i64>,
     /// Resource pack serving is active (proxy has replaced the downstream ResourcePacksInfo with its own pack list).
     /// Client RP responses are handled by the proxy; the downstream receives HAVE_ALL/COMPLETED.
     rp_serving: bool,
@@ -85,17 +92,20 @@ impl SessionState {
         self.captured_login.as_deref()
     }
 
-    /// Drains and returns tracked boss bars and scoreboard objectives (used to tear down the previous server's state on transfer).
-    pub fn take_tracked(&mut self) -> (Vec<i64>, Vec<String>) {
+    /// Drains and returns tracked boss bars, scoreboard objectives, and actor entities
+    /// (used to tear down the previous server's state on transfer).
+    pub fn take_tracked(&mut self) -> (Vec<i64>, Vec<String>, Vec<i64>) {
         let bossbars = self.bossbars.drain().collect();
         let objectives = self.objectives.drain().collect();
-        (bossbars, objectives)
+        let entities = self.entities.drain().collect();
+        (bossbars, objectives, entities)
     }
 
     /// Seeds the tracking sets with the new server's initial state (in preparation for the next transfer).
-    pub fn seed_tracked(&mut self, bossbars: Vec<i64>, objectives: Vec<String>) {
+    pub fn seed_tracked(&mut self, bossbars: Vec<i64>, objectives: Vec<String>, entities: Vec<i64>) {
         self.bossbars = bossbars.into_iter().collect();
         self.objectives = objectives.into_iter().collect();
+        self.entities = entities.into_iter().collect();
     }
 }
 
@@ -363,6 +373,21 @@ fn try_intercept(
             packets::ID_REMOVE_OBJECTIVE if channel_transfer => {
                 if let Some(name) = packets::parse_remove_objective_name(p) {
                     state.objectives.remove(&name);
+                }
+            }
+            // Track actor entities so they can be despawned on the next transfer. Live tracking only
+            // sees small batches (large ones are skipped); the initial spawn's entities are captured
+            // separately from the new server's spawn buffer (see downstream.rs).
+            packets::ID_ADD_ACTOR | packets::ID_ADD_ITEM_ACTOR | packets::ID_ADD_PAINTING
+                if channel_transfer =>
+            {
+                if let Some(uid) = packets::parse_actor_unique_id(p) {
+                    state.entities.insert(uid);
+                }
+            }
+            packets::ID_REMOVE_ACTOR if channel_transfer => {
+                if let Some(uid) = packets::parse_actor_unique_id(p) {
+                    state.entities.remove(&uid);
                 }
             }
             _ => {}

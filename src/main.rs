@@ -475,19 +475,24 @@ async fn do_transfer(
         Err(e) => tracing::warn!(%target, "game rule extraction failed (skipping): {e}"),
     }
 
-    // Old server state teardown: remove tracked boss bars and scoreboards from the client
-    // (residual state not cleared by the dimension flip).
-    let (old_bossbars, old_objectives) = state.take_tracked();
+    // Old server state teardown: remove tracked boss bars, scoreboards, and actor entities from the
+    // client (residual state not reliably cleared by the dimension flip — actor entities especially
+    // linger as ghosts without explicit RemoveActor).
+    let (old_bossbars, old_objectives, old_entities) = state.take_tracked();
     for id in &old_bossbars {
         send_pkt(client, &packets::boss_event_hide(*id)).await?;
     }
     for name in &old_objectives {
         send_pkt(client, &packets::remove_objective(name)).await?;
     }
-    if !old_bossbars.is_empty() || !old_objectives.is_empty() {
+    for uid in &old_entities {
+        send_pkt(client, &packets::remove_actor(*uid)).await?;
+    }
+    if !old_bossbars.is_empty() || !old_objectives.is_empty() || !old_entities.is_empty() {
         tracing::info!(
             bossbars = old_bossbars.len(),
             objectives = old_objectives.len(),
+            entities = old_entities.len(),
             "old server state torn down"
         );
     }
@@ -518,8 +523,8 @@ async fn do_transfer(
             .map_err(|e| anyhow!("spawn stream replay failed: {e:?}"))?;
     }
 
-    // Seed tracked state with the new server's initial boss bars/scoreboards (for the next transfer teardown).
-    state.seed_tracked(ready.bossbars, ready.objectives);
+    // Seed tracked state with the new server's initial boss bars/scoreboards/entities (for the next transfer teardown).
+    state.seed_tracked(ready.bossbars, ready.objectives, ready.entities);
 
     tracing::info!(%target, "transfer sequence sent");
     Ok(true)

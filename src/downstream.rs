@@ -51,6 +51,9 @@ pub struct ReadyDownstream {
     /// Boss bars and scoreboard objectives raised during the spawn stream (seed for the next transfer's teardown).
     pub bossbars: Vec<i64>,
     pub objectives: Vec<String>,
+    /// Actor entities (actorUniqueId) spawned during the spawn stream — seed for the next transfer's teardown.
+    /// Captures the full spawn (large batches included), which live interception skips.
+    pub entities: Vec<i64>,
     /// Spawn stream messages sent by the new server from StartGame through PlayStatus(PLAYER_SPAWN),
     /// excluding the StartGame packet itself. Replayed to the client after the transfer to populate
     /// chunks, inventory, and entities — without this the client lands in an empty world (0-chunk bug).
@@ -91,9 +94,10 @@ async fn drive(addr: SocketAddr, raknet_version: u8, login_packet: &[u8]) -> Res
     let mut gamemode: i32 = 0;
     let mut start_game_bytes: Vec<u8> = Vec::new();
     let mut spawn_buffer: Vec<Vec<u8>> = Vec::new();
-    // Track boss bars and scoreboard objectives on the new server (seed for the next transfer's teardown).
+    // Track boss bars, scoreboard objectives, and actor entities on the new server (seed for the next transfer's teardown).
     let mut track_bossbars: HashSet<i64> = HashSet::new();
     let mut track_objectives: HashSet<String> = HashSet::new();
+    let mut track_entities: HashSet<i64> = HashSet::new();
 
     loop {
         let msg = raknet_recv(&socket).await?;
@@ -194,6 +198,17 @@ async fn drive(addr: SocketAddr, raknet_version: u8, login_packet: &[u8]) -> Res
                         track_objectives.remove(&name);
                     }
                 }
+                // Track actor entities streamed during spawn (for the next transfer's teardown).
+                packets::ID_ADD_ACTOR | packets::ID_ADD_ITEM_ACTOR | packets::ID_ADD_PAINTING => {
+                    if let Some(uid) = packets::parse_actor_unique_id(pkt) {
+                        track_entities.insert(uid);
+                    }
+                }
+                packets::ID_REMOVE_ACTOR => {
+                    if let Some(uid) = packets::parse_actor_unique_id(pkt) {
+                        track_entities.remove(&uid);
+                    }
+                }
                 _ => {}
             }
         }
@@ -225,6 +240,7 @@ async fn drive(addr: SocketAddr, raknet_version: u8, login_packet: &[u8]) -> Res
                 start_game: start_game_bytes,
                 bossbars: track_bossbars.into_iter().collect(),
                 objectives: track_objectives.into_iter().collect(),
+                entities: track_entities.into_iter().collect(),
                 spawn_buffer,
             });
         }

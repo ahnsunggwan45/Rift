@@ -26,6 +26,14 @@ pub const ID_GAME_RULES_CHANGED: u32 = 0x48;
 pub const ID_BOSS_EVENT: u32 = 0x4a;
 pub const ID_SET_DISPLAY_OBJECTIVE: u32 = 0x6b;
 pub const ID_REMOVE_OBJECTIVE: u32 = 0x6a;
+// Actor spawn/despawn — tracked so the previous server's entities can be removed on transfer.
+// AddActor/AddItemActor/AddPainting/RemoveActor all encode actorUniqueId as their first field.
+// (AddPlayer is not tracked: it carries no actorUniqueId, and real players are cleared via the
+//  dimension change plus the new server's PlayerList.)
+pub const ID_ADD_ACTOR: u32 = 0x0d;
+pub const ID_REMOVE_ACTOR: u32 = 0x0e;
+pub const ID_ADD_ITEM_ACTOR: u32 = 0x0f;
+pub const ID_ADD_PAINTING: u32 = 0x16;
 
 // GameRuleType.
 const GAMERULE_TYPE_BOOL: u32 = 1;
@@ -207,6 +215,16 @@ pub fn remove_objective(name: &str) -> Vec<u8> {
     p
 }
 
+/// RemoveActorPacket: `[header][actorUniqueId zigzag-VarLong]`. Despawns an entity the previous
+/// backend spawned. Sent on transfer because the dimension flip does not reliably clear actor
+/// entities (mobs/NPCs/items/paintings) on the client — they otherwise linger as ghosts.
+pub fn remove_actor(actor_unique_id: i64) -> Vec<u8> {
+    let mut p = Vec::new();
+    write_varint_u32(ID_REMOVE_ACTOR, &mut p);
+    write_zigzag_i64(actor_unique_id, &mut p);
+    p
+}
+
 /// Reads a string (UnsignedVarInt length prefix + bytes) at the given offset. Returns the string value; the caller does not need to compute a new offset.
 fn read_string_at(buf: &[u8], off: usize) -> Option<String> {
     let (len, n) = read_varint_u32(buf.get(off..)?).ok()?;
@@ -237,6 +255,15 @@ pub fn parse_set_display_objective_name(pkt: &[u8]) -> Option<String> {
 pub fn parse_remove_objective_name(pkt: &[u8]) -> Option<String> {
     let (_, hl) = read_varint_u32(pkt).ok()?;
     read_string_at(pkt, hl)
+}
+
+/// Reads the leading actorUniqueId (zigzag-VarLong) common to AddActor / AddItemActor / AddPainting
+/// / RemoveActor (each encodes it as the first field after the header). Used to track entities for
+/// teardown on transfer. Best-effort.
+pub fn parse_actor_unique_id(pkt: &[u8]) -> Option<i64> {
+    let (_, hl) = read_varint_u32(pkt).ok()?;
+    let (uid, _) = read_zigzag_i64(pkt.get(hl..)?).ok()?;
+    Some(uid)
 }
 
 /// Returns the offset after skipping a string (UnsignedVarInt length prefix + bytes).
@@ -584,6 +611,15 @@ mod tests {
         let p = remove_objective("sidebar_obj");
         assert_eq!(peek_packet_id(&p).unwrap(), ID_REMOVE_OBJECTIVE);
         assert_eq!(parse_remove_objective_name(&p).unwrap(), "sidebar_obj");
+    }
+
+    #[test]
+    fn remove_actor_roundtrips_via_parse() {
+        let p = remove_actor(123456789);
+        assert_eq!(peek_packet_id(&p).unwrap(), ID_REMOVE_ACTOR);
+        assert_eq!(parse_actor_unique_id(&p).unwrap(), 123456789);
+        // negative ids round-trip through zigzag too
+        assert_eq!(parse_actor_unique_id(&remove_actor(-42)).unwrap(), -42);
     }
 
     #[test]
