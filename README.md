@@ -16,6 +16,16 @@ Rift sits in front of your [PocketMine-MP](https://github.com/pmmp/PocketMine-MP
 - **Production-minded** — graceful shutdown, panic-free packet parsing, bounded fragment reassembly (DoS-resistant), reliable-packet de-duplication, multi-core Tokio runtime.
 - Configurable MTU, Vibrant Visuals override, metrics.
 
+## Quick start
+
+1. **Build** (or grab a release binary): `cargo build --release` → `target/release/rift`
+2. **Configure**: `cp config.example.toml config.toml`, then point `[servers]` at your backend addresses.
+3. **Run**: `./rift config.toml`
+4. **Prepare each backend** PMMP server: set `enable-encryption: false` and install the [RiftSupport](downstream/RiftSupport) plugin (one drop-in — see [Requirements](#requirements)).
+5. **Connect** your Bedrock client to the proxy's address, and switch servers seamlessly.
+
+For production (auto-restart, console, firewall), see [Run](#run) and [`dist-linux/DEPLOY.md`](dist-linux/DEPLOY.md).
+
 ## How it works
 
 Rift terminates RakNet itself: clients connect to Rift, and Rift opens its own RakNet connection to each downstream server. Game packets are shuttled as opaque bytes — only login, transfer, resource-pack and a few spawn-related packets are decoded.
@@ -31,16 +41,24 @@ Entity IDs are **not** rewritten. Instead, every server assigns the same player 
 
 ## Requirements
 
-Each **downstream PMMP server** must:
+Each **downstream PMMP server** behind Rift needs two things:
 
-**1. Disable encryption** (`pocketmine.yml`):
-```yaml
-network:
-  enable-encryption: false
-```
-Rift forwards the client's login token verbatim, so the XUID is preserved.
+1. **Encryption off** — `enable-encryption: false` in `pocketmine.yml`. Rift forwards the client's login token verbatim, so the XUID is preserved.
+2. **Deterministic entity IDs** — every server must assign the same player the same runtime entity id, so the client's view of "itself" stays consistent across a transfer.
 
-**2. Assign deterministic entity IDs.** In your custom `Player` class (a tiny plugin works), make the runtime/entity ID identical on every server:
+### Easiest: the RiftSupport plugin
+
+Drop the [`downstream/RiftSupport`](downstream/RiftSupport) plugin into each backend server. It:
+
+- swaps in a `Player` that sets a deterministic id (`crc32(XUID)`), and
+- warns you on startup if encryption is still on, or if a custom `Player` class needs the manual step below.
+
+Load it as a folder with [DevTools](https://github.com/pmmp/DevTools), or build a `.phar`.
+
+### Manual (servers with a custom `Player` class)
+
+If your server already uses its own `Player` subclass, RiftSupport won't replace it — add this to that class instead:
+
 ```php
 protected function initEntity(CompoundTag $nbt) : void {
     parent::initEntity($nbt);
@@ -49,7 +67,8 @@ protected function initEntity(CompoundTag $nbt) : void {
     $this->id = crc32($key) & 0x7FFFFFFFFFFFFFFF;
 }
 ```
-> Deploy this to **every** downstream server. Otherwise a transferred player's own entity (and warps) will break.
+
+> Either way this must apply on **every** downstream server, or a transferred player's own entity (and warps) will break.
 
 ## Build
 
@@ -117,9 +136,10 @@ Set `web_addr` in `config.toml` (e.g. `"0.0.0.0:8080"`):
 ## Project layout
 
 ```
-src/                  proxy core — intercept, transfer, packets, web, console, registry, ...
-vendor/rift-raknet/   vendored, patched fork of rust-raknet (Bedrock RakNet)
-dist-linux/           deploy assets — start.sh, setup.sh, rift.service, DEPLOY.md
+src/                    proxy core — intercept, transfer, packets, web, console, registry, ...
+vendor/rift-raknet/     vendored, patched fork of rust-raknet (Bedrock RakNet)
+downstream/RiftSupport/ drop-in PMMP plugin — deterministic entity ids for backends
+dist-linux/             deploy assets — start.sh, setup.sh, rift.service, DEPLOY.md
 ```
 
 ## Compatibility

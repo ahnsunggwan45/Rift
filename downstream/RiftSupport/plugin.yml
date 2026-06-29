@@ -1,0 +1,7 @@
+name: RiftSupport
+main: Rift\Main
+version: 1.0.0
+api: [5.0.0]
+author: ahnsunggwan45
+website: https://github.com/ahnsunggwan45/Rift
+description: Makes a PocketMine-MP server Rift-ready - deterministic entity IDs for seamless cross-server transfer.
