@@ -25,7 +25,7 @@ Rift optimizes for a few **measurable** targets (observe them at [`/metrics`](#w
 - 🔀 **Seamless server transfer** — switch backends with no reconnect; game mode, game rules, boss bars and scoreboards carry over.
 - 🧩 **PMMP-optimized** — deterministic entity IDs via the drop-in [RiftSupport](downstream/RiftSupport) plugin.
 - 🌐 **Cross-platform** — builds on Linux & Windows; fully static `musl` binaries run on any distro.
-- 📊 **Built-in metrics** — `/metrics` endpoint + a live web dashboard.
+- 📊 **Built-in observability** — `/metrics` + a live web dashboard, per-player ping, JSONL metrics history, and CPU / allocation profiling hooks.
 - 🎛️ **Live console** — `info` / `list` / `transfer` / `kick` / `stop`.
 - 🛡️ **Production-minded** — graceful shutdown, panic-free parsing, DoS-resistant fragment reassembly, reliable-packet de-dup.
 
@@ -158,10 +158,19 @@ All options are documented in [`config.example.toml`](config.example.toml).
 Set `web_addr` in `config.toml` (e.g. `"0.0.0.0:8080"`):
 
 - `http://<host>:8080/` — auto-refreshing dashboard
-- `GET /metrics` — JSON: counts, throughput, transfers, per-server
-- `GET /players` — JSON: id, name, ip, server
+- `GET /metrics` — JSON: active/peak players, throughput, packet rate, avg packet size, avg forward latency, transfers, per-server (plus `alloc_*` on a profiling build)
+- `GET /players` — JSON: id, name, ip, server, ping (RTT), uptime
 
 > `/players` exposes player names and IPs — keep the port behind a firewall if it's reachable publicly.
+
+## Performance measurement
+
+Rift follows a **measure-then-optimize** policy, so the tooling to gather real data is built in:
+
+- **Time-series history** — set `history_file` in `config.toml` to append a metrics snapshot (one JSON object per line) every `history_interval_secs`. Leave it on in production to collect throughput / latency / player-count history over time.
+- **CPU profiling** — to find *which function* is hot, build the symbol-included `profiling` profile and sample with Linux `perf`. See [`PROFILING.md`](PROFILING.md).
+- **Allocation profiling** — a `--features profiling` build exposes `alloc_count` / `alloc_bytes` at `/metrics` to verify the hot path stays allocation-free.
+- **Load testing** — [`tools/riftbench`](tools/riftbench) connects N offline bots through Rift and generates realistic player traffic, so you can find the ceiling yourself (requires an offline-mode backend).
 
 ## Project layout
 
@@ -169,7 +178,9 @@ Set `web_addr` in `config.toml` (e.g. `"0.0.0.0:8080"`):
 src/                    proxy core — intercept, transfer, packets, web, console, registry, ...
 vendor/rift-raknet/     vendored, patched fork of rust-raknet (Bedrock RakNet)
 downstream/RiftSupport/ drop-in PMMP plugin — deterministic entity ids for backends
+tools/riftbench/        load tester — N offline bots over gophertunnel
 dist-linux/             deploy assets — start.sh, setup.sh, rift.service, DEPLOY.md
+PROFILING.md            CPU / allocation profiling workflow
 ```
 
 ## Compatibility
@@ -201,6 +212,7 @@ Rift targets the Bedrock protocol used by current PocketMine-MP builds. The spec
 
 **Operations**
 - ✅ Graceful shutdown
+- ✅ Metrics history (JSONL time-series) · CPU/alloc profiling guide · load tester ([`tools/riftbench`](tools/riftbench))
 - ⬜ Connection rate limiting
 - ⬜ Prometheus / OpenTelemetry · JSON logging · admin API · graceful (zero-downtime) restart
 
