@@ -33,6 +33,10 @@ pub struct Config {
 pub struct Runtime {
     /// Number of Tokio worker threads (multi-core tuning). Unset or 0 means auto-detect by core count.
     pub worker_threads: Option<usize>,
+    /// RakNet ACK/retransmit tick interval (ms). Unset = 10 (WaterdogPE parity). Lower = tighter ACK and
+    /// loss recovery for high-ping players, at the cost of more per-connection wakeups. Data is never
+    /// gated by this (packets flush immediately). Clamped to [1, 1000].
+    pub ack_tick_ms: Option<u64>,
 }
 
 /// Metrics and observability. Gate for measurement-driven hardening.

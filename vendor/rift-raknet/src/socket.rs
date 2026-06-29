@@ -23,6 +23,17 @@ use crate::{arq::*, packet::*, raknet_log_debug, utils::*};
 // Rift Phase 1: deliver received messages as Bytes (eliminates deep-copy, lays the groundwork for zero-copy passthrough).
 use bytes::Bytes;
 
+/// Runtime-configurable ACK/retransmit tick interval (ms). Default 10 (WaterdogPE parity). Lower =
+/// tighter ACK + loss recovery and less RTT inflation, at the cost of more wakeups per connection.
+/// Data is NOT gated by this (packets flush immediately on send); it only governs ACK/NACK/retransmit
+/// timing. Set from the proxy config via `set_ack_tick_ms`.
+pub static ACK_TICK_MS: AtomicI64 = AtomicI64::new(10);
+
+/// Sets the ACK/retransmit tick interval (ms), clamped to [1, 1000]. Applies to all sockets' tick loops.
+pub fn set_ack_tick_ms(ms: u64) {
+    ACK_TICK_MS.store(ms.clamp(1, 1000) as i64, Ordering::Relaxed);
+}
+
 /// Raknet socket wrapper with local and remote.
 pub struct RaknetSocket {
     local_addr: SocketAddr,
@@ -637,7 +648,7 @@ impl RaknetSocket {
         tokio::spawn(async move {
             loop {
                 sleep(std::time::Duration::from_millis(
-                    SendQ::TICK_INTERVAL_MILLS as u64,
+                    ACK_TICK_MS.load(Ordering::Relaxed) as u64,
                 ))
                 .await;
 

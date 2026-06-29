@@ -29,6 +29,10 @@ force = false                  # true = clients who decline the pack cannot conn
 # Multi-core tuning. Omit or set to 0 to use all logical cores automatically.
 [runtime]
 # worker_threads = 8
+# RakNet ACK/retransmit tick (ms). Default 10 (WaterdogPE parity). Lower = tighter ACK + loss recovery
+# for high-ping players, at the cost of more per-connection wakeups. Data is never delayed by this
+# (packets flush on send); it only governs ACK/NACK/retransmit timing. Range 1–1000.
+# ack_tick_ms = 10
 
 # Observability.
 [metrics]

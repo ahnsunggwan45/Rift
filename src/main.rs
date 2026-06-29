@@ -121,6 +121,11 @@ async fn run(cfg: Arc<Config>) -> Result<()> {
     let force_vv = cfg.features.force_vibrant_visuals;
     let channel_transfer = cfg.features.channel_transfer;
 
+    // RakNet ACK/retransmit tick (ms). Default 10 (WaterdogPE parity); lower = tighter ACK/loss recovery.
+    let ack_tick = cfg.runtime.ack_tick_ms.unwrap_or(10);
+    rift_raknet::set_ack_tick_ms(ack_tick);
+    tracing::info!(ack_tick_ms = ack_tick, "RakNet ACK/retransmit tick configured");
+
     // Resource packs: if enabled, load from the packs/ directory. Falls back to disabled if load fails or yields 0 packs,
     // since this is on the handshake critical path.
     let packs: Option<Arc<packs::PackStore>> = if cfg.resource_packs.enabled {
