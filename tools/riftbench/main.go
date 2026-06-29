@@ -54,8 +54,17 @@ type stats struct {
 	dropped   atomic.Int64 // 스폰 후 끊김(킥/에러)
 	sent      atomic.Int64 // 보낸 입력 패킷 누계
 
-	mu   sync.Mutex
-	lats []time.Duration // 부하 중 표본 RTT(봇별 주기 수집)
+	mu         sync.Mutex
+	lats       []time.Duration // 부하 중 표본 RTT(봇별 주기 수집)
+	errSamples []string        // 실패 원인 표본(최대 6개) — 왜 실패했는지
+}
+
+func (st *stats) addErr(s string) {
+	st.mu.Lock()
+	if len(st.errSamples) < 6 {
+		st.errSamples = append(st.errSamples, s)
+	}
+	st.mu.Unlock()
 }
 
 func main() {
@@ -104,6 +113,14 @@ func main() {
 	fmt.Printf("접속 실패 : %d\n", st.failed.Load())
 	fmt.Printf("도중 끊김 : %d\n", st.dropped.Load())
 	fmt.Printf("입력 전송 : %d 패킷\n", st.sent.Load())
+	st.mu.Lock()
+	if len(st.errSamples) > 0 {
+		fmt.Println("실패 원인(표본):")
+		for _, e := range st.errSamples {
+			fmt.Println("  -", e)
+		}
+	}
+	st.mu.Unlock()
 	printLatency(&st)
 	fmt.Println("\n프록시 측 지표는 Rift 대시보드(/metrics·/players)·metrics.jsonl 에서 같은 구간을 확인하라.")
 }
@@ -120,9 +137,13 @@ func bot(ctx context.Context, i int, st *stats, wg *sync.WaitGroup) {
 		},
 	}
 
-	conn, err := d.DialContext(ctx, "raknet", *target)
+	// 다이얼당 15초 상한 — 안 듣는 포트면 빨리 실패하게.
+	dctx, dcancel := context.WithTimeout(ctx, 15*time.Second)
+	conn, err := d.DialContext(dctx, "raknet", *target)
+	dcancel()
 	if err != nil {
 		st.failed.Add(1)
+		st.addErr("dial: " + err.Error())
 		return
 	}
 	defer conn.Close()
@@ -130,6 +151,7 @@ func bot(ctx context.Context, i int, st *stats, wg *sync.WaitGroup) {
 
 	if err := conn.DoSpawnTimeout(20 * time.Second); err != nil {
 		st.failed.Add(1)
+		st.addErr("spawn: " + err.Error())
 		return
 	}
 	st.spawned.Add(1)
