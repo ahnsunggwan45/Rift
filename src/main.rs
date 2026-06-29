@@ -444,7 +444,10 @@ async fn do_transfer(
     // then restore to Overworld.
     let final_dim = packets::DIM_OVERWORLD;
     let flip_dim = packets::DIM_NETHER;
-    let empty = packets::empty_chunk_payload(packets::dimension_biome_sections(final_dim));
+    // Filler chunks must match the dimension the client is currently in (the flip dimension), not the
+    // final one. A mismatched dimension/biome-section count (24 overworld vs 8 nether) corrupts the
+    // chunk parse during the transition and destabilizes the client renderer (glyph/HUD glitches).
+    let empty = packets::empty_chunk_payload(packets::dimension_biome_sections(flip_dim));
 
     // (1) Play: flip to dummy dimension → client flushes old world (chunk/entity cache).
     send_pkt(client, &packets::change_dimension(flip_dim, pos, false)).await?;
@@ -459,7 +462,7 @@ async fn do_transfer(
         for dz in -4..=4 {
             send_pkt(
                 client,
-                &packets::level_chunk(spawn_cx + dx, spawn_cz + dz, final_dim, 1, &empty),
+                &packets::level_chunk(spawn_cx + dx, spawn_cz + dz, flip_dim, 1, &empty),
             )
             .await?;
         }
