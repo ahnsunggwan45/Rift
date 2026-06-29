@@ -443,6 +443,14 @@ async fn do_transfer(
     // honored while the client is still in the entity's dimension. (A dimension change does NOT
     // despawn actor entities client-side, so without this they ghost after transfer.)
     let (old_bossbars, old_objectives, old_entities) = state.take_tracked();
+    // Always-on diagnostic: confirms this build is live and reports how many entities were tracked.
+    tracing::info!(
+        tracked_entities = old_entities.len(),
+        bossbars = old_bossbars.len(),
+        objectives = old_objectives.len(),
+        %target,
+        "transfer teardown — removing tracked entities before flip"
+    );
     let mut removed_entities = 0usize;
     for uid in &old_entities {
         if *uid as u64 == runtime_id {
