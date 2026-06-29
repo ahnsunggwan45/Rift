@@ -51,3 +51,11 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = true        # 디버그 심볼 제거 → 릴리스 바이너리 크기 감소
+
+# 프로파일링 빌드: 릴리스와 동일 최적화 + 심볼 유지(strip=false, debug 정보).
+# perf/flamegraph 로 "어느 함수가 핫한지" 보려면 이 빌드로 떠야 한다.
+#   cargo build --profile profiling   → target/profiling/rift (심볼 포함)
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false

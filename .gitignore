@@ -11,4 +11,6 @@ packs/
 dist-linux/rift
 dist-linux/rift-musl
 dist-linux/rift.stripped
+dist-linux/rift-prof
 *.log
+*.jsonl
