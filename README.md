@@ -4,7 +4,7 @@ A fast, seamless reverse proxy for **Minecraft: Bedrock Edition**, written in Ru
 
 Rift sits in front of your [PocketMine-MP](https://github.com/pmmp/PocketMine-MP) servers and moves players between them **without a reconnect** — no "Disconnected" screen, no re-login, no resource-pack reload. It's a lightweight, high-performance alternative to WaterdogPE.
 
-> **Status:** actively developed. Core proxying and seamless transfer are verified in-game. See [Status](#status) for what's battle-tested vs. experimental.
+> **Status:** actively developed. Core proxying and seamless transfer are verified in-game. See the [Roadmap](#roadmap) for what's done vs. planned.
 
 ## Goals
 
@@ -19,13 +19,15 @@ Rift optimizes for a few **measurable** targets (observe them at [`/metrics`](#w
 
 ## Features
 
-- **Seamless server switching** — players move between downstream servers with only a brief loading screen (dimension-flip technique, inspired by [Spectrum](https://github.com/cooldogedev/spectrum)). Game mode, game rules, boss bars and scoreboards are carried over.
-- **Transparent byte-stream proxy** — game packets are forwarded as raw bytes; only the handful Rift needs to act on are decoded. Low CPU, low latency.
-- **Resource-pack serving** — optionally serve one pack set from the proxy to every downstream server (Waterdog-style replace).
-- **Built-in web dashboard** — live player counts, throughput, transfers and a per-server breakdown.
-- **Console** — `info` / `list` / `transfer` / `kick` / `stop`, just like a PMMP console.
-- **Production-minded** — graceful shutdown, panic-free packet parsing, bounded fragment reassembly (DoS-resistant), reliable-packet de-duplication, multi-core Tokio runtime.
-- Configurable MTU, Vibrant Visuals override, metrics.
+- ⚡ **High-performance Bedrock / RakNet proxy** written in Rust.
+- 🚀 **Packet pass-through fast path** — zero object creation for non-intercepted packets.
+- 🎯 **Selective packet interception** — only the few packets Rift must act on are decoded.
+- 🔀 **Seamless server transfer** — switch backends with no reconnect; game mode, game rules, boss bars and scoreboards carry over.
+- 🧩 **PMMP-optimized** — deterministic entity IDs via the drop-in [RiftSupport](downstream/RiftSupport) plugin.
+- 🌐 **Cross-platform** — builds on Linux & Windows; fully static `musl` binaries run on any distro.
+- 📊 **Built-in metrics** — `/metrics` endpoint + a live web dashboard.
+- 🎛️ **Live console** — `info` / `list` / `transfer` / `kick` / `stop`.
+- 🛡️ **Production-minded** — graceful shutdown, panic-free parsing, DoS-resistant fragment reassembly, reliable-packet de-dup.
 
 ## Quick start
 
@@ -52,12 +54,11 @@ Entity IDs are **not** rewritten. Instead, every server assigns the same player 
 
 ## Design principles
 
-Deliberate choices, worth preserving:
-
-- **Byte-stream proxy** — decode only the few packets Rift must act on; forward everything else as raw bytes (no object creation on the hot path).
-- **Vendored, patched RakNet** ([`vendor/rift-raknet`](vendor/rift-raknet)) — Rift owns its RakNet layer, so the data path is tuned directly: copy-minimized framing, bounded fragment reassembly (DoS-resistant), reliable-packet de-duplication.
-- **Packet fast-path** — a small interest bitmap rejects uninteresting packet IDs in a single lookup.
-- **Measure, then optimize** — metrics come first. Bolt-on optimizations (packet pooling, worker-sharding, io_uring) are applied only after real-server measurement shows they help.
+- **Keep the fast path small** — decode only the few packets Rift must act on; forward everything else as raw bytes (no object creation, no parsing on the hot path).
+- **Zero unnecessary allocations / parsing** — uninteresting packet IDs are rejected by a single interest-bitmap lookup and passed straight through.
+- **Own the transport** — Rift vendors a patched RakNet fork ([`vendor/rift-raknet`](vendor/rift-raknet)), so the data path is tuned directly: copy-minimized framing, bounded fragment reassembly (DoS-resistant), reliable-packet de-duplication.
+- **PMMP-first** — the transfer model and deterministic entity-ID scheme are built around PocketMine-MP.
+- **Measure, then optimize** — metrics first; heavier work (pooling, worker-sharding, io_uring) only after real-server measurement. Predictable latency over feature bloat.
 
 ## Requirements
 
@@ -89,6 +90,15 @@ protected function initEntity(CompoundTag $nbt) : void {
 ```
 
 > Either way this must apply on **every** downstream server, or a transferred player's own entity (and warps) will break.
+
+## Security / trust model
+
+Rift uses a **split trust model**: encryption is intentionally dropped on the trusted hop to avoid double-encryption overhead, while the untrusted hop stays protected.
+
+- **Proxy ↔ backend: plaintext** — backends run `enable-encryption: false`. The proxy and backends are expected to sit on the same trusted private network, so encrypting this hop would only add cost.
+- **Client ↔ proxy:** the public hop. The intended model is to **terminate Bedrock encryption at the proxy** here, so the client link is encrypted while the backend link stays plaintext.
+
+> ⚠️ **Current status:** client-side encryption termination is **not wired yet** — Rift currently runs plaintext on *both* hops. Until it lands, deploy Rift where the **client↔proxy path is trusted** (LAN / VPN / a fronting layer). The crypto layer (`src/crypto.rs`, P-384 ECDH + AES-CTR) is in the tree; wiring it is the next security milestone (see [Roadmap](#roadmap)).
 
 ## Build
 
@@ -166,12 +176,35 @@ dist-linux/             deploy assets — start.sh, setup.sh, rift.service, DEPL
 
 Rift targets the Bedrock protocol used by current PocketMine-MP builds. The specific packet IDs Rift decodes live in `src/` and may need updating when Bedrock bumps its protocol.
 
-## Status
+## Roadmap
 
-- ✅ Connect + seamless transfer (chunks, players, game mode, game rules, state teardown) — verified in-game.
-- ✅ Copy-minimized data path (application-level zero-copy), panic-free parsing, fragment + reliable-packet hardening — unit & integration tested.
-- ⚠️ Resource-pack serving — implemented, not yet verified in-game (disabled by default).
-- 🔭 Roadmap (pending real-server measurement): per-worker `SO_REUSEPORT` sockets (one UDP socket per core → no shared-socket contention), `sendmmsg`/`recvmmsg`, io_uring, NUMA pinning, packet pooling, and richer metrics (per-operation latency, per-core throughput, worker imbalance).
+**Core**
+- ✅ RakNet transport · login · resource-pack phase
+- ✅ Seamless server transfer — StartGame interception, state teardown (verified in-game)
+- ✅ Metrics endpoint · web dashboard · live console
+- ⬜ Client-side encryption termination (see [Security](#security--trust-model))
+- ⬜ Config hot-reload
+
+**Performance**
+- ✅ mimalloc (optional) · packet pass-through fast path
+- ✅ Application-level zero-copy (Bytes data path)
+- ✅ Bounded fragment reassembly · reliable-packet de-dup
+- ✅ Profiling build with allocation counters (`--features profiling`)
+- ⬜ Buffer / packet pool · arena allocation
+- ⬜ `sendmmsg` / `recvmmsg` · worker sharding + `SO_REUSEPORT` · CPU affinity / NUMA
+- ⬜ io_uring · libdeflate
+
+**Networking**
+- ✅ Multiple backends + transfer · configurable MTU
+- ⬜ Health checks · auto-reconnect · weighted routing / load balancing
+- ⬜ Proxy Protocol · MTU auto-negotiation
+
+**Operations**
+- ✅ Graceful shutdown
+- ⬜ Connection rate limiting
+- ⬜ Prometheus / OpenTelemetry · JSON logging · admin API · graceful (zero-downtime) restart
+
+> ⚠️ Resource-pack serving is implemented but **not yet verified in-game** (off by default). Linux performance items are deferred until real-server measurement.
 
 ## License
 
