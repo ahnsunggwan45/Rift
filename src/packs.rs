@@ -1,13 +1,14 @@
-//! 리소스팩 로딩 + 서빙 (WDPE replace 방식).
+//! Resource pack loading + serving (WDPE replace approach).
 //!
-//! 프록시가 `packs/` 폴더의 `.mcpack`/`.zip` 을 로드해 클라 리소스팩 단계를 **직접 소유**한다.
-//! 다운스트림이 보내는 ResourcePacksInfo/Stack 은 무시(클라엔 프록시 팩만 노출)되고,
-//! 모든 다운스트림에 동일하게 적용된다. (intercept.rs 가 흐름을 중개)
+//! The proxy takes full ownership of the client resource-pack handshake by loading every
+//! `.mcpack`/`.zip` from the `packs/` directory. ResourcePacksInfo/Stack sent by the downstream
+//! are ignored; only proxy-owned packs are exposed to the client, applied uniformly across all
+//! downstreams. (intercept.rs brokers the flow.)
 //!
-//! packId 체계 (PMMP ResourcePacksPacketHandler 기준):
-//! - ResourcePacksInfo 엔트리: **바이너리 UUID(16)** + version 문자열.
-//! - 클라 SEND_PACKS: `"uuid_version"` 문자열 목록 (서버는 '_' 로 분리해 uuid 추출).
-//! - DataInfo/ChunkRequest/ChunkData/Stack: **uuid 문자열**.
+//! packId scheme (based on PMMP ResourcePacksPacketHandler):
+//! - ResourcePacksInfo entry: **binary UUID (16 bytes)** + version string.
+//! - Client SEND_PACKS: list of `"uuid_version"` strings (server splits on '_' to extract uuid).
+//! - DataInfo/ChunkRequest/ChunkData/Stack: **uuid string**.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -17,10 +18,10 @@ use sha2::{Digest, Sha256};
 
 use crate::framing::write_varint_u32;
 
-/// 청크 크기 (PMMP PACK_CHUNK_SIZE 와 동일, 256KB).
+/// Chunk size (matches PMMP PACK_CHUNK_SIZE, 256 KB).
 pub const CHUNK_SIZE: u32 = 256 * 1024;
 
-// 패킷 ID.
+// Packet IDs.
 const ID_RESOURCE_PACKS_INFO: u32 = 0x06;
 const ID_RESOURCE_PACK_STACK: u32 = 0x07;
 const ID_RESOURCE_PACK_DATA_INFO: u32 = 0x52;
@@ -29,28 +30,28 @@ const ID_RESOURCE_PACK_CHUNK_DATA: u32 = 0x53;
 /// ResourcePackType (RESOURCES).
 const PACK_TYPE_RESOURCES: u8 = 6;
 
-/// 로드된 팩 하나.
+/// A single loaded resource pack.
 pub struct LoadedPack {
-    /// manifest header.uuid 의 16바이트 (표준 big-endian 순서; 인코딩 시 Bedrock 형식으로 변환).
+    /// 16 bytes from manifest header.uuid (standard big-endian order; converted to Bedrock format on encode).
     pub uuid: [u8; 16],
-    /// 정규 uuid 문자열("xxxxxxxx-xxxx-..."). DataInfo/Stack/ChunkRequest 매칭용.
+    /// Canonical uuid string ("xxxxxxxx-xxxx-..."). Used for matching DataInfo/Stack/ChunkRequest.
     pub uuid_str: String,
     /// "major.minor.patch".
     pub version: String,
-    /// 전체 .mcpack/.zip 바이트 (청크로 서빙).
+    /// Full .mcpack/.zip bytes (served in chunks).
     pub bytes: Arc<Vec<u8>>,
-    /// 파일 전체 SHA-256.
+    /// SHA-256 of the entire file.
     pub sha256: [u8; 32],
     pub size: u64,
     pub chunk_count: u32,
 }
 
-/// 로드된 전체 팩 + 사전 빌드된 ResourcePacksInfo/Stack 게임패킷.
+/// All loaded packs plus pre-built ResourcePacksInfo/Stack game packets.
 pub struct PackStore {
     pub packs: Vec<LoadedPack>,
-    /// 사전 빌드된 ResourcePacksInfo 패킷(0x06, 압축 전 단일 패킷 바이트).
+    /// Pre-built ResourcePacksInfo packet (0x06, single packet bytes before compression).
     pub info_packet: Vec<u8>,
-    /// 사전 빌드된 ResourcePackStack 패킷(0x07).
+    /// Pre-built ResourcePackStack packet (0x07).
     pub stack_packet: Vec<u8>,
 }
 
@@ -59,12 +60,12 @@ impl PackStore {
         self.packs.is_empty()
     }
 
-    /// uuid 문자열로 팩 찾기 (대소문자 무시 — PMMP 동일).
+    /// Find a pack by uuid string (case-insensitive — matches PMMP behavior).
     pub fn find(&self, uuid_str: &str) -> Option<&LoadedPack> {
         self.packs.iter().find(|p| p.uuid_str.eq_ignore_ascii_case(uuid_str))
     }
 
-    /// DataInfo 패킷(0x52) 빌드.
+    /// Build a DataInfo packet (0x52).
     pub fn data_info_packet(pack: &LoadedPack) -> Vec<u8> {
         let mut p = Vec::new();
         write_varint_u32(ID_RESOURCE_PACK_DATA_INFO, &mut p);
@@ -78,7 +79,7 @@ impl PackStore {
         p
     }
 
-    /// ChunkData 패킷(0x53) 빌드.
+    /// Build a ChunkData packet (0x53).
     pub fn chunk_data_packet(uuid_str: &str, chunk_index: u32, offset: u64, data: &[u8]) -> Vec<u8> {
         let mut p = Vec::new();
         write_varint_u32(ID_RESOURCE_PACK_CHUNK_DATA, &mut p);
@@ -90,16 +91,16 @@ impl PackStore {
     }
 }
 
-/// 폴더의 .mcpack/.zip 을 모두 로드하고 info/stack 패킷을 사전 빌드한다.
+/// Load all .mcpack/.zip files from a folder and pre-build info/stack packets.
 pub fn load(folder: &str, force: bool) -> Result<PackStore> {
     let mut packs = Vec::new();
     let dir = Path::new(folder);
     if dir.is_dir() {
         let mut entries: Vec<_> = std::fs::read_dir(dir)
-            .with_context(|| format!("팩 폴더 읽기 실패: {folder}"))?
+            .with_context(|| format!("failed to read pack folder: {folder}"))?
             .filter_map(|e| e.ok().map(|e| e.path()))
             .collect();
-        entries.sort(); // 결정론적 순서
+        entries.sort(); // deterministic ordering
         for path in entries {
             let ext = path
                 .extension()
@@ -111,14 +112,14 @@ pub fn load(folder: &str, force: bool) -> Result<PackStore> {
             }
             match load_one(&path) {
                 Ok(p) => {
-                    tracing::info!(pack = %p.uuid_str, version = %p.version, size = p.size, chunks = p.chunk_count, "리소스팩 로드");
+                    tracing::info!(pack = %p.uuid_str, version = %p.version, size = p.size, chunks = p.chunk_count, "resource pack loaded");
                     packs.push(p);
                 }
-                Err(e) => tracing::warn!(path = %path.display(), "리소스팩 로드 실패(스킵): {e}"),
+                Err(e) => tracing::warn!(path = %path.display(), "resource pack load failed (skipping): {e}"),
             }
         }
     } else {
-        tracing::warn!(%folder, "팩 폴더가 없음 — 빈 팩 세트로 진행");
+        tracing::warn!(%folder, "pack folder not found — proceeding with empty pack set");
     }
     let info_packet = build_info_packet(&packs, force);
     let stack_packet = build_stack_packet(&packs, force);
@@ -126,14 +127,14 @@ pub fn load(folder: &str, force: bool) -> Result<PackStore> {
 }
 
 fn load_one(path: &Path) -> Result<LoadedPack> {
-    let bytes = std::fs::read(path).with_context(|| format!("팩 파일 읽기 실패: {}", path.display()))?;
+    let bytes = std::fs::read(path).with_context(|| format!("failed to read pack file: {}", path.display()))?;
     let manifest = read_manifest(&bytes)?;
-    let json: serde_json::Value = serde_json::from_slice(&manifest).context("manifest.json 파싱 실패")?;
-    let header = json.get("header").context("manifest 에 header 없음")?;
+    let json: serde_json::Value = serde_json::from_slice(&manifest).context("failed to parse manifest.json")?;
+    let header = json.get("header").context("manifest missing header")?;
     let uuid_str = header
         .get("uuid")
         .and_then(|v| v.as_str())
-        .context("manifest header.uuid 없음")?
+        .context("manifest header.uuid missing")?
         .to_string();
     let uuid = parse_uuid(&uuid_str)?;
     let version = header
@@ -164,57 +165,57 @@ fn load_one(path: &Path) -> Result<LoadedPack> {
     })
 }
 
-/// zip 안에서 manifest.json 을 찾아 읽는다(루트 또는 하위 폴더).
+/// Locate and read manifest.json inside a zip (root preferred, falls back to any sub-path).
 fn read_manifest(zip_bytes: &[u8]) -> Result<Vec<u8>> {
     use std::io::Read;
     let mut zip =
-        zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)).context("zip 아카이브 열기 실패")?;
-    // manifest.json 의 정확 경로(루트 우선, 없으면 *manifest.json 으로 끝나는 첫 엔트리).
+        zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)).context("failed to open zip archive")?;
+    // Exact path for manifest.json (root preferred; otherwise first entry ending with manifest.json).
     let name = if zip.by_name("manifest.json").is_ok() {
         "manifest.json".to_string()
     } else {
         zip.file_names()
             .find(|n| n.ends_with("manifest.json") || n.ends_with("manifest.json/"))
             .map(|s| s.to_string())
-            .ok_or_else(|| anyhow!("zip 안에 manifest.json 없음"))?
+            .ok_or_else(|| anyhow!("manifest.json not found in zip"))?
     };
-    let mut f = zip.by_name(&name).context("manifest.json 엔트리 열기 실패")?;
+    let mut f = zip.by_name(&name).context("failed to open manifest.json entry")?;
     let mut buf = Vec::new();
     f.read_to_end(&mut buf)?;
     Ok(buf)
 }
 
-/// "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" → 16바이트(표준 big-endian 순서).
+/// Parse "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" into 16 bytes (standard big-endian order).
 fn parse_uuid(s: &str) -> Result<[u8; 16]> {
     let hex: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
     if hex.len() != 32 {
-        return Err(anyhow!("UUID 형식 오류: {s}"));
+        return Err(anyhow!("invalid UUID format: {s}"));
     }
     let mut out = [0u8; 16];
     for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).context("UUID hex 파싱 실패")?;
+        *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).context("failed to parse UUID hex")?;
     }
     Ok(out)
 }
 
-/// ResourcePacksInfoPacket(0x06) 빌드.
+/// Build a ResourcePacksInfoPacket (0x06).
 fn build_info_packet(packs: &[LoadedPack], force: bool) -> Vec<u8> {
     let mut p = Vec::new();
     write_varint_u32(ID_RESOURCE_PACKS_INFO, &mut p);
     p.push(force as u8); // mustAccept
     p.push(0); // hasAddons
     p.push(0); // hasScripts
-    p.push(0); // forceDisableVibrantVisuals = false (VV 활성 유지)
+    p.push(0); // forceDisableVibrantVisuals = false (keep VV enabled)
     put_uuid(&mut p, &[0u8; 16]); // worldTemplateId
     put_string(&mut p, b""); // worldTemplateVersion
-    p.extend_from_slice(&(packs.len() as u16).to_le_bytes()); // 엔트리 수 (LE u16)
+    p.extend_from_slice(&(packs.len() as u16).to_le_bytes()); // entry count (LE u16)
     for pack in packs {
-        put_uuid(&mut p, &pack.uuid); // packId (바이너리 UUID)
+        put_uuid(&mut p, &pack.uuid); // packId (binary UUID)
         put_string(&mut p, pack.version.as_bytes()); // version
         p.extend_from_slice(&pack.size.to_le_bytes()); // sizeBytes LE u64
         put_string(&mut p, b""); // encryptionKey
         put_string(&mut p, b""); // subPackName
-        put_string(&mut p, pack.uuid_str.as_bytes()); // contentId (PMMP 는 packId 사용)
+        put_string(&mut p, pack.uuid_str.as_bytes()); // contentId (PMMP uses packId here)
         p.push(0); // hasScripts
         p.push(0); // isAddonPack
         p.push(0); // isRtxCapable
@@ -223,12 +224,12 @@ fn build_info_packet(packs: &[LoadedPack], force: bool) -> Vec<u8> {
     p
 }
 
-/// ResourcePackStackPacket(0x07) 빌드.
+/// Build a ResourcePackStackPacket (0x07).
 fn build_stack_packet(packs: &[LoadedPack], force: bool) -> Vec<u8> {
     let mut p = Vec::new();
     write_varint_u32(ID_RESOURCE_PACK_STACK, &mut p);
     p.push(force as u8); // mustAccept
-    write_varint_u32(packs.len() as u32, &mut p); // 스택 엔트리 수 (UnsignedVarInt)
+    write_varint_u32(packs.len() as u32, &mut p); // stack entry count (UnsignedVarInt)
     for pack in packs {
         put_string(&mut p, pack.uuid_str.as_bytes()); // packId
         put_string(&mut p, pack.version.as_bytes()); // version
@@ -242,8 +243,8 @@ fn build_stack_packet(packs: &[LoadedPack], force: bool) -> Vec<u8> {
     p
 }
 
-/// ResourcePackClientResponsePacket(0x08) 파싱 → (status, packIds). best-effort.
-/// packIds 는 "uuid_version" 형식.
+/// Parse a ResourcePackClientResponsePacket (0x08) → (status, packIds). Best-effort.
+/// packIds are in "uuid_version" format.
 pub fn parse_client_response(pkt: &[u8]) -> Option<(u8, Vec<String>)> {
     let (_, hl) = crate::framing::read_varint_u32(pkt).ok()?;
     let mut off = hl;
@@ -260,7 +261,7 @@ pub fn parse_client_response(pkt: &[u8]) -> Option<(u8, Vec<String>)> {
     Some((status, ids))
 }
 
-/// ResourcePackChunkRequestPacket(0x54) 파싱 → (packId uuid 문자열, chunkIndex). best-effort.
+/// Parse a ResourcePackChunkRequestPacket (0x54) → (packId uuid string, chunkIndex). Best-effort.
 pub fn parse_chunk_request(pkt: &[u8]) -> Option<(String, u32)> {
     let (_, hl) = crate::framing::read_varint_u32(pkt).ok()?;
     let (uuid, off) = read_string(pkt, hl)?;
@@ -273,21 +274,21 @@ pub fn parse_chunk_request(pkt: &[u8]) -> Option<(String, u32)> {
     Some((uuid, idx))
 }
 
-// ---- 인코딩 헬퍼 ----
+// ---- Encoding helpers ----
 
-/// Bedrock UUID 인코딩: 앞 8바이트 역순 + 뒤 8바이트 역순.
+/// Bedrock UUID encoding: reverse the first 8 bytes, then reverse the last 8 bytes.
 fn put_uuid(out: &mut Vec<u8>, uuid: &[u8; 16]) {
     out.extend(uuid[0..8].iter().rev());
     out.extend(uuid[8..16].iter().rev());
 }
 
-/// string: UnsignedVarInt 길이 + 바이트.
+/// String encoding: UnsignedVarInt length prefix + bytes.
 fn put_string(out: &mut Vec<u8>, bytes: &[u8]) {
     write_varint_u32(bytes.len() as u32, out);
     out.extend_from_slice(bytes);
 }
 
-/// 오프셋의 string 을 읽어 (값, 다음 오프셋) 반환.
+/// Read a string at the given offset; returns (value, next offset).
 fn read_string(buf: &[u8], off: usize) -> Option<(String, usize)> {
     let (len, n) = crate::framing::read_varint_u32(buf.get(off..)?).ok()?;
     let start = off + n;

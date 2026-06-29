@@ -1,26 +1,26 @@
-//! Bedrock 게임패킷 암호화 — AES-256-CTR "fake GCM".
+//! Bedrock game-packet encryption — AES-256-CTR "fake GCM".
 //!
-//! PMMP `EncryptionContext` 의 1:1 포팅 (ground truth: docs/phase1b-design.md).
-//! - 암호: AES-256-CTR, IV = key[0:12] ++ 00 00 00 02 (OpenSSL CTR = 128bit BE 카운터).
-//! - CTR 키스트림은 연결 내내 연속(패킷마다 재초기화 X).
-//! - 패킷마다 8바이트 checksum = SHA256( LE_u64(counter) ++ payload ++ key )[0:8].
-//! - 암/복호 counter 분리, 각 0부터 패킷당 +1.
+//! A 1:1 port of PMMP `EncryptionContext` (ground truth: docs/phase1b-design.md).
+//! - Cipher: AES-256-CTR, IV = key[0:12] ++ 00 00 00 02 (OpenSSL CTR = 128-bit BE counter).
+//! - The CTR keystream is continuous across the entire connection (no re-initialization per packet).
+//! - Per-packet 8-byte checksum = SHA256( LE_u64(counter) ++ payload ++ key )[0:8].
+//! - Separate encrypt/decrypt counters, each starting at 0 and incrementing by 1 per packet.
 
-#![allow(dead_code)] // Phase 1b 핸드셰이크 연결 전까지 일부 미사용
+#![allow(dead_code)] // Some items unused until the Phase 1b handshake is wired up
 
 use aes::cipher::{KeyIvInit, StreamCipher};
 use p384::{PublicKey, SecretKey};
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 
-/// OpenSSL "AES-256-CTR" 과 동일: 16바이트 IV 전체를 128bit 빅엔디언 카운터로 사용.
+/// Matches OpenSSL "AES-256-CTR": the full 16-byte IV is treated as a 128-bit big-endian counter.
 type Aes256Ctr = ctr::Ctr128BE<aes::Aes256>;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum DecryptError {
-    /// 페이로드가 checksum(8) 을 담기엔 너무 짧음.
+    /// Payload is too short to contain the 8-byte checksum.
     TooShort,
-    /// checksum 불일치 (변조 또는 카운터/키 불일치).
+    /// Checksum mismatch (tampering or counter/key desync).
     BadChecksum,
 }
 
@@ -33,7 +33,7 @@ pub struct EncryptionContext {
 }
 
 impl EncryptionContext {
-    /// 32바이트 키로 컨텍스트를 만든다. IV 는 key[0:12] ++ 00000002.
+    /// Creates a context from a 32-byte key. IV = key[0:12] ++ 00000002.
     pub fn new(key: [u8; 32]) -> Self {
         let mut iv = [0u8; 16];
         iv[..12].copy_from_slice(&key[..12]);
@@ -47,7 +47,7 @@ impl EncryptionContext {
         }
     }
 
-    /// 평문 배치를 암호화한다: AES_CTR(payload ++ checksum).
+    /// Encrypts a plaintext batch: AES_CTR(payload ++ checksum).
     pub fn encrypt(&mut self, payload: &[u8]) -> Vec<u8> {
         let checksum = self.checksum(self.encrypt_counter, payload);
         self.encrypt_counter = self.encrypt_counter.wrapping_add(1);
@@ -59,7 +59,7 @@ impl EncryptionContext {
         buf
     }
 
-    /// 암호문을 복호화하고 checksum 을 검증한다. 성공 시 평문 배치를 반환.
+    /// Decrypts ciphertext and verifies the checksum. Returns the plaintext batch on success.
     pub fn decrypt(&mut self, data: &[u8]) -> Result<Vec<u8>, DecryptError> {
         if data.len() < 9 {
             return Err(DecryptError::TooShort);
@@ -92,15 +92,15 @@ impl EncryptionContext {
     }
 }
 
-/// P-384(secp384r1) 비밀키를 생성한다. 같은 키를 ECDH(공유비밀)와 ECDSA/ES384
-/// JWT 서명에 모두 쓴다 — Bedrock 핸드셰이크는 한 키로 서명+키교환을 한다.
-/// 프록시는 클라측/다운스트림측에 각각 별도 키를 생성해 제시한다.
+/// Generates a P-384 (secp384r1) secret key. The same key is used for both ECDH (shared secret)
+/// and ECDSA/ES384 JWT signing — the Bedrock handshake uses one key for both signing and key exchange.
+/// The proxy generates a separate key for each side: client-facing and downstream-facing.
 pub fn generate_secret_key() -> SecretKey {
     SecretKey::random(&mut OsRng)
 }
 
-/// ECDH 공유비밀(48바이트 빅엔디언 X좌표)을 도출한다. OpenSSL `openssl_pkey_derive`
-/// (PMMP) 와 동일한 바이트열이 나오므로 그대로 `derive_key` 에 넣을 수 있다.
+/// Derives the ECDH shared secret (48-byte big-endian X coordinate). Produces the same byte sequence
+/// as OpenSSL `openssl_pkey_derive` (PMMP), so the result can be passed directly to `derive_key`.
 pub fn ecdh_shared_secret(local: &SecretKey, remote: &PublicKey) -> [u8; 48] {
     let shared = p384::ecdh::diffie_hellman(local.to_nonzero_scalar(), remote.as_affine());
     let mut out = [0u8; 48];
@@ -108,10 +108,10 @@ pub fn ecdh_shared_secret(local: &SecretKey, remote: &PublicKey) -> [u8; 48] {
     out
 }
 
-/// 암호화 키 유도: key = SHA256( salt ++ shared_secret ).
+/// Derives the encryption key: key = SHA256( salt ++ shared_secret ).
 ///
-/// `shared_secret` 는 P-384 ECDH 의 48바이트 빅엔디언 X좌표여야 한다
-/// (PMMP: hex2bin(str_pad(secret,96,'0',LEFT))).
+/// `shared_secret` must be the 48-byte big-endian X coordinate from P-384 ECDH
+/// (PMMP: `hex2bin(str_pad(secret,96,'0',LEFT))`).
 pub fn derive_key(salt: &[u8], shared_secret: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(salt);
@@ -126,8 +126,8 @@ pub fn derive_key(salt: &[u8], shared_secret: &[u8]) -> [u8; 32] {
 mod tests {
     use super::*;
 
-    /// 같은 키를 가진 두 컨텍스트(서버/클라)가 실제로 통신 가능한지 —
-    /// 한쪽 encrypt → 다른쪽 decrypt 가 여러 패킷에 걸쳐 키스트림/카운터 동기 유지.
+    /// Verifies that two contexts sharing the same key (server/client) can communicate —
+    /// encrypt on one side → decrypt on the other maintains keystream/counter sync across multiple packets.
     #[test]
     fn cross_context_roundtrip_multi_packet() {
         let key = [7u8; 32];
@@ -135,16 +135,16 @@ mod tests {
         let mut client = EncryptionContext::new(key);
 
         for i in 0..32u8 {
-            let msg = vec![i; (i as usize) * 13 + 1]; // 길이 가변
+            let msg = vec![i; (i as usize) * 13 + 1]; // variable length
             let ct = server.encrypt(&msg);
-            // 암호문은 평문과 달라야 함 (checksum 8바이트 추가)
+            // Ciphertext must differ from plaintext (8 checksum bytes appended)
             assert_eq!(ct.len(), msg.len() + 8);
-            let pt = client.decrypt(&ct).expect("복호 성공");
-            assert_eq!(pt, msg, "패킷 {i} 라운드트립 불일치");
+            let pt = client.decrypt(&ct).expect("decryption succeeded");
+            assert_eq!(pt, msg, "packet {i} round-trip mismatch");
         }
     }
 
-    /// 양방향 동시 통신 (한 컨텍스트의 encrypt/decrypt 스트림이 독립).
+    /// Bidirectional simultaneous communication (encrypt and decrypt streams within one context are independent).
     #[test]
     fn bidirectional() {
         let key = [0x42u8; 32];
@@ -160,7 +160,7 @@ mod tests {
         assert_eq!(a.decrypt(&c2).unwrap(), m2);
     }
 
-    /// 변조된 암호문은 checksum 검증에서 거부돼야 함.
+    /// Tampered ciphertext must be rejected by checksum verification.
     #[test]
     fn tampered_rejected() {
         let key = [1u8; 32];
@@ -168,11 +168,11 @@ mod tests {
         let mut client = EncryptionContext::new(key);
 
         let mut ct = server.encrypt(b"important payload");
-        ct[3] ^= 0xff; // 변조
+        ct[3] ^= 0xff; // tamper
         assert_eq!(client.decrypt(&ct), Err(DecryptError::BadChecksum));
     }
 
-    /// 너무 짧은 입력 거부.
+    /// Inputs that are too short must be rejected.
     #[test]
     fn too_short_rejected() {
         let key = [9u8; 32];
@@ -180,7 +180,7 @@ mod tests {
         assert_eq!(ctx.decrypt(&[0u8; 8]), Err(DecryptError::TooShort));
     }
 
-    /// 카운터가 어긋나면(패킷 유실 시뮬) checksum 이 깨져야 함 — 순서 의존성 확인.
+    /// Counter desync (simulating packet loss) must corrupt the checksum — validates ordering dependency.
     #[test]
     fn counter_desync_detected() {
         let key = [5u8; 32];
@@ -189,11 +189,11 @@ mod tests {
 
         let _c0 = server.encrypt(b"packet 0");
         let c1 = server.encrypt(b"packet 1");
-        // 클라가 c0 를 건너뛰고 c1 을 복호하려 하면 키스트림/카운터 어긋나 실패.
+        // If the client skips c0 and tries to decrypt c1, the keystream/counter is desynced and decryption fails.
         assert!(client.decrypt(&c1).is_err());
     }
 
-    /// derive_key 결정성.
+    /// `derive_key` must be deterministic.
     #[test]
     fn derive_key_deterministic() {
         let salt = [0xab; 16];
@@ -202,8 +202,8 @@ mod tests {
         assert_ne!(derive_key(&salt, &secret), derive_key(&[0u8; 16], &secret));
     }
 
-    /// ECDH: 양측이 상대 공개키로 도출한 공유비밀(48B)이 동일해야 하고,
-    /// 그걸 derive_key 에 넣으면 같은 AES 키가 나와야 한다 (핸드셰이크 정합성).
+    /// ECDH: both sides deriving the shared secret (48 B) from each other's public key must agree,
+    /// and feeding that secret into `derive_key` must produce the same AES key (handshake correctness).
     #[test]
     fn ecdh_both_sides_derive_same_key() {
         let a_sec = generate_secret_key();
@@ -213,12 +213,12 @@ mod tests {
 
         let s_ab = ecdh_shared_secret(&a_sec, &b_pub);
         let s_ba = ecdh_shared_secret(&b_sec, &a_pub);
-        assert_eq!(s_ab, s_ba, "ECDH 공유비밀 양측 불일치");
+        assert_eq!(s_ab, s_ba, "ECDH shared secret mismatch between sides");
 
         let salt = [0x11u8; 16];
         assert_eq!(derive_key(&salt, &s_ab), derive_key(&salt, &s_ba));
 
-        // 그리고 이 키로 만든 두 EncryptionContext 가 실제 통신 가능해야 한다.
+        // The two EncryptionContexts built from this key must also be able to communicate.
         let key = derive_key(&salt, &s_ab);
         let mut server = EncryptionContext::new(key);
         let mut client = EncryptionContext::new(key);

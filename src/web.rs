@@ -1,10 +1,11 @@
-//! 경량 HTTP 모니터링 엔드포인트.
+//! Lightweight HTTP monitoring endpoints.
 //!
-//! 의존성 추가 없이(axum/hyper 미사용) tokio `TcpListener` 위에 최소 HTTP/1.1 응답만 구현한다.
-//! 프록시 정체성("경량")에 맞춰 읽기 전용 + 짧은 응답이라 keep-alive 없이 응답마다 연결 종료.
-//! - `GET /metrics` → JSON 스냅샷 (외부 대시보드/스크립트용, CORS 허용)
-//! - `GET /players` → 세션 목록 JSON (이름/IP/서버; 레지스트리 기반)
-//! - `GET /`        → 자동 갱신 HTML 대시보드 (브라우저에서 바로 확인)
+//! Implements minimal HTTP/1.1 responses on top of a tokio `TcpListener` with no extra
+//! dependencies (no axum/hyper). Keeping with the proxy's lightweight identity, responses are
+//! read-only and short; connections are closed after each response (no keep-alive).
+//! - `GET /metrics` → JSON snapshot (for external dashboards/scripts, CORS enabled)
+//! - `GET /players` → session list JSON (name/IP/server; backed by the registry)
+//! - `GET /`        → auto-refreshing HTML dashboard (open directly in a browser)
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -15,17 +16,17 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::metrics::Metrics;
 use crate::registry::Registry;
 
-/// 웹 모니터링 서버를 백그라운드 태스크로 띄운다. bind 실패해도 프록시 본체는 계속 돈다.
+/// Spawn the web monitoring server as a background task. Bind failures do not affect the proxy.
 pub fn spawn(metrics: Arc<Metrics>, registry: Arc<Registry>, addr: SocketAddr) {
     tokio::spawn(async move {
         let listener = match TcpListener::bind(addr).await {
             Ok(l) => l,
             Err(e) => {
-                tracing::error!(%addr, "웹 모니터링 bind 실패: {e} — 모니터링 비활성");
+                tracing::error!(%addr, "web monitoring bind failed: {e} — monitoring disabled");
                 return;
             }
         };
-        tracing::info!(%addr, "웹 모니터링 시작 (GET / 대시보드, /metrics, /players)");
+        tracing::info!(%addr, "web monitoring started (GET / dashboard, /metrics, /players)");
         loop {
             match listener.accept().await {
                 Ok((stream, _peer)) => {
@@ -33,11 +34,11 @@ pub fn spawn(metrics: Arc<Metrics>, registry: Arc<Registry>, addr: SocketAddr) {
                     let r = registry.clone();
                     tokio::spawn(async move {
                         if let Err(e) = handle_conn(stream, m, r).await {
-                            tracing::debug!("웹 연결 처리 오류: {e}");
+                            tracing::debug!("web connection error: {e}");
                         }
                     });
                 }
-                Err(e) => tracing::warn!("웹 accept 실패: {e}"),
+                Err(e) => tracing::warn!("web accept failed: {e}"),
             }
         }
     });
@@ -48,8 +49,10 @@ async fn handle_conn(
     metrics: Arc<Metrics>,
     registry: Arc<Registry>,
 ) -> std::io::Result<()> {
-    // 요청 라인만 필요하다. 헤더 끝(\r\n\r\n)까지 최대 8KB 읽고 첫 줄에서 메서드/경로 추출.
-    // 5초 안에 요청을 다 못 받으면 드롭 — 유휴/slow-loris 연결이 태스크를 붙잡지 못하게.
+    // Only the request line is needed. Read up to 8 KB until the header end (\r\n\r\n),
+    // then extract the method and path from the first line.
+    // Drop if the full request is not received within 5 seconds — prevents idle/slow-loris
+    // connections from holding a task open.
     let mut buf = [0u8; 8192];
     let n = match tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let mut n = 0usize;
@@ -69,7 +72,7 @@ async fn handle_conn(
     {
         Ok(Ok(n)) => n,
         Ok(Err(e)) => return Err(e),
-        Err(_) => return Ok(()), // 타임아웃 → 조용히 드롭
+        Err(_) => return Ok(()), // timeout — drop silently
     };
     let req = String::from_utf8_lossy(&buf[..n]);
     let path = req
@@ -101,11 +104,11 @@ async fn handle_conn(
     stream.flush().await
 }
 
-/// 자체 포함 대시보드. /metrics + /players 를 2초마다 폴링해 렌더링한다(외부 의존 없음).
+/// Self-contained dashboard. Polls /metrics + /players every 2 seconds (no external dependencies).
 const DASHBOARD_HTML: &str = r#"<!doctype html>
-<html lang="ko"><head><meta charset="utf-8">
+<html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Rift 모니터링</title>
+<title>Rift Monitoring</title>
 <style>
 :root{--bg:#0e1116;--card:#171b22;--line:#262b34;--fg:#e6edf3;--mut:#8b949e;--accent:#ff7ab6;--ok:#3fb950}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif}
@@ -124,25 +127,25 @@ tr:last-child td{border-bottom:none}.num{text-align:right}.mut{color:var(--mut)}
 .pill{background:#21262d;border-radius:20px;padding:2px 10px;font-size:12px}
 </style></head>
 <body>
-<header><span class="dot"></span><h1>Rift 모니터링</h1><span class="mut" id="up"></span></header>
+<header><span class="dot"></span><h1>Rift Monitoring</h1><span class="mut" id="up"></span></header>
 <div class="wrap">
   <div class="grid">
-    <div class="card"><div class="k">접속 중</div><div class="v" id="active">–</div></div>
-    <div class="card"><div class="k">누적 접속</div><div class="v" id="total">–</div></div>
-    <div class="card"><div class="k">채널이동</div><div class="v" id="tx">–</div></div>
-    <div class="card"><div class="k">업로드</div><div class="v" id="up_r">–<small> KiB/s</small></div></div>
-    <div class="card"><div class="k">다운로드</div><div class="v" id="dn_r">–<small> KiB/s</small></div></div>
-    <div class="card"><div class="k">패킷/초</div><div class="v" id="pps">–</div></div>
-    <div class="card"><div class="k">평균 패킷</div><div class="v" id="avg">–<small> B</small></div></div>
-    <div class="card" id="alloc_card" style="display:none"><div class="k">할당(누적)</div><div class="v" id="alloc">–</div></div>
-    <div class="card"><div class="k">최대 동시</div><div class="v" id="peak">–</div></div>
-    <div class="card"><div class="k">누적 송수신</div><div class="v" id="total_bytes">–</div></div>
-    <div class="card"><div class="k">포워드 지연</div><div class="v" id="fwd">–<small> μs</small></div></div>
+    <div class="card"><div class="k">Online</div><div class="v" id="active">–</div></div>
+    <div class="card"><div class="k">Total Connections</div><div class="v" id="total">–</div></div>
+    <div class="card"><div class="k">Transfers</div><div class="v" id="tx">–</div></div>
+    <div class="card"><div class="k">Upload</div><div class="v" id="up_r">–<small> KiB/s</small></div></div>
+    <div class="card"><div class="k">Download</div><div class="v" id="dn_r">–<small> KiB/s</small></div></div>
+    <div class="card"><div class="k">Packets/s</div><div class="v" id="pps">–</div></div>
+    <div class="card"><div class="k">Avg Packet</div><div class="v" id="avg">–<small> B</small></div></div>
+    <div class="card" id="alloc_card" style="display:none"><div class="k">Alloc (total)</div><div class="v" id="alloc">–</div></div>
+    <div class="card"><div class="k">Peak Concurrent</div><div class="v" id="peak">–</div></div>
+    <div class="card"><div class="k">Total Bytes</div><div class="v" id="total_bytes">–</div></div>
+    <div class="card"><div class="k">Forward Latency</div><div class="v" id="fwd">–<small> μs</small></div></div>
   </div>
-  <h2>서버별 인원</h2>
-  <table><thead><tr><th>서버</th><th class="num">인원</th></tr></thead><tbody id="servers"></tbody></table>
-  <h2>접속자</h2>
-  <table><thead><tr><th>이름</th><th>IP</th><th>서버</th><th class="num">핑</th><th class="num">접속</th></tr></thead><tbody id="players"></tbody></table>
+  <h2>Players per Server</h2>
+  <table><thead><tr><th>Server</th><th class="num">Players</th></tr></thead><tbody id="servers"></tbody></table>
+  <h2>Connected Players</h2>
+  <table><thead><tr><th>Name</th><th>IP</th><th>Server</th><th class="num">Ping</th><th class="num">Connected</th></tr></thead><tbody id="players"></tbody></table>
   <p class="mut" id="err"></p>
 </div>
 <script>
@@ -158,8 +161,8 @@ async function tick(){
     document.getElementById('active').textContent=m.active;
     document.getElementById('total').textContent=m.connections_total;
     document.getElementById('peak').textContent=m.peak_active;
-    document.getElementById('tx').textContent=m.transfers+(m.transfers_failed?` (실패 ${m.transfers_failed})`:'');
-    document.getElementById('up').textContent='가동 '+fmtUp(m.uptime_secs);
+    document.getElementById('tx').textContent=m.transfers+(m.transfers_failed?` (failed: ${m.transfers_failed})`:'');
+    document.getElementById('up').textContent='uptime '+fmtUp(m.uptime_secs);
     if(prev){const dt=(now-prevT)/1000||1;
       document.getElementById('up_r').innerHTML=Math.max(0,Math.round((m.bytes_up-prev.bytes_up)/1024/dt))+'<small> KiB/s</small>';
       document.getElementById('dn_r').innerHTML=Math.max(0,Math.round((m.bytes_down-prev.bytes_down)/1024/dt))+'<small> KiB/s</small>';
@@ -171,10 +174,10 @@ async function tick(){
     if(m.alloc_count>0){document.getElementById('alloc_card').style.display='';
       document.getElementById('alloc').innerHTML=m.alloc_count.toLocaleString()+'<small> ('+Math.round(m.alloc_bytes/1048576)+' MiB)</small>';}
     const sv=Object.entries(m.per_server).sort((a,b)=>b[1]-a[1]);
-    document.getElementById('servers').innerHTML=sv.length?sv.map(([k,v])=>`<tr><td>${k}</td><td class="num">${v}</td></tr>`).join(''):'<tr><td colspan=2 class="mut">없음</td></tr>';
-    document.getElementById('players').innerHTML=p.length?p.map(x=>`<tr><td>${x.name||'<span class=mut>?</span>'}</td><td class="mut">${x.peer}</td><td><span class="pill">${x.server}</span></td><td class="num">${x.rtt_ms?x.rtt_ms+'ms':'–'}</td><td class="num mut">${fmtDur(x.connected_secs)}</td></tr>`).join(''):'<tr><td colspan=5 class="mut">없음</td></tr>';
+    document.getElementById('servers').innerHTML=sv.length?sv.map(([k,v])=>`<tr><td>${k}</td><td class="num">${v}</td></tr>`).join(''):'<tr><td colspan=2 class="mut">none</td></tr>';
+    document.getElementById('players').innerHTML=p.length?p.map(x=>`<tr><td>${x.name||'<span class=mut>?</span>'}</td><td class="mut">${x.peer}</td><td><span class="pill">${x.server}</span></td><td class="num">${x.rtt_ms?x.rtt_ms+'ms':'–'}</td><td class="num mut">${fmtDur(x.connected_secs)}</td></tr>`).join(''):'<tr><td colspan=5 class="mut">none</td></tr>';
     document.getElementById('err').textContent='';
-  }catch(e){document.getElementById('err').textContent='연결 끊김 — 재시도 중…';}
+  }catch(e){document.getElementById('err').textContent='Connection lost — retrying…';}
 }
 tick();setInterval(tick,2000);
 </script>

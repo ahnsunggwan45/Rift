@@ -1,11 +1,12 @@
-//! 다운스트림→클라 게임패킷 인터셉션 (평문 A모드).
+//! Downstream→client game-packet interception (plaintext mode A).
 //!
-//! 핫패스 철학: 배치를 디코드해 **패킷 ID만 peek**, 우리가 손댈 패킷만 처리하고
-//! 나머지는 원본 바이트 그대로 전달(재압축 없음).
-//! - VV flip: 리소스팩 단계(청크 前) 1회 → 끝나면 더 안 봄.
-//! - TransferPacket 감지: 계속 감시하되, **작은 배치만 디코드**(큰 청크 배치는 스킵)해 비용 회피.
+//! Hot-path philosophy: decode the batch to **peek packet IDs only**; handle only
+//! the packets we care about and forward everything else as raw bytes (no recompression).
+//! - VV flip: one-shot during the resource-pack phase (before chunks) → ignored afterwards.
+//! - TransferPacket detection: always watched, but **only small batches are decoded**
+//!   (large chunk batches are skipped) to avoid unnecessary overhead.
 //!
-//! 게임패킷: `0xfe` + (NetworkSettings 후) `[압축타입][데이터]`, 그 전엔 raw 배치.
+//! Game packets: `0xfe` + (after NetworkSettings) `[compression_type][data]`; raw batches before that.
 
 use std::collections::HashSet;
 
@@ -31,9 +32,10 @@ const RP_STATUS_SEND_PACKS: u8 = 2;
 const RP_STATUS_HAVE_ALL_PACKS: u8 = 3;
 const RP_STATUS_COMPLETED: u8 = 4;
 
-/// 관심 패킷 ID bitmap(10비트 ID 공간). 핫패스에서 배열 1회 조회로 대다수 패킷을 즉시 통과시킨다
-/// (분기예측 친화 — match 의 순차 비교보다 비관심 패킷에서 유리). 관심 ID 만 true 인 superset이고,
-/// 동적 게이팅(watching_vv/channel_transfer/rp)은 match 가드가 담당한다.
+/// Bitmap of interesting packet IDs (10-bit ID space). A single array lookup on the hot path
+/// lets most packets pass immediately (branch-prediction friendly — faster than sequential match
+/// comparisons for uninteresting packets). This is a superset of IDs we might care about;
+/// dynamic gating (watching_vv / channel_transfer / rp) is handled by match guards.
 const fn interest(ids: &[u32]) -> [bool; 256] {
     let mut t = [false; 256];
     let mut i = 0;
@@ -44,7 +46,7 @@ const fn interest(ids: &[u32]) -> [bool; 256] {
     t
 }
 
-/// down(서버→클라)에서 우리가 손대는 패킷 ID 전체.
+/// All packet IDs we touch in the down (server→client) direction.
 const DOWN_INTEREST: [bool; 256] = interest(&[
     ID_NETWORK_SETTINGS,
     ID_RESOURCE_PACKS_INFO,
@@ -55,51 +57,52 @@ const DOWN_INTEREST: [bool; 256] = interest(&[
     packets::ID_REMOVE_OBJECTIVE,
 ]);
 
-/// transfer 감시 시(VV 끝난 후) 이 크기(바이트) 넘는 배치는 디코드 안 함 — 청크 등 대형 패킷 회피.
-/// TransferPacket 배치는 작다(서버명 + 몇 바이트).
+/// While watching for transfers (after VV is done), batches larger than this (in bytes) are not
+/// decoded — avoids paying for large chunk batches. Transfer packet batches are small (server name + a few bytes).
 const TRANSFER_SCAN_MAX: usize = 512;
 
-/// 연결당 세션 상태 (up/down 공유).
+/// Per-connection session state (shared between the up and down paths).
 #[derive(Default)]
 pub struct SessionState {
-    /// NetworkSettings 이후 압축 ON (양방향 공유).
+    /// Compression enabled after NetworkSettings (shared for both directions).
     compression_on: bool,
-    /// VV flip 완료.
+    /// VV flip completed.
     vv_done: bool,
-    /// 캡처한 클라 Login 패킷(압축 해제된 패킷 바이트). 전환 시 새 서버에 리플레이.
+    /// Captured client Login packet (decompressed packet bytes). Replayed to the new server on transfer.
     captured_login: Option<Vec<u8>>,
-    /// 현재 서버가 띄운 보스바(bossActorUniqueId). 전환 시 HIDE 로 청소.
+    /// Boss bars (bossActorUniqueId) raised by the current server. Cleaned up with HIDE on transfer.
     bossbars: HashSet<i64>,
-    /// 현재 서버가 띄운 스코어보드 목표 이름. 전환 시 RemoveObjective 로 청소.
+    /// Scoreboard objective names raised by the current server. Cleaned up with RemoveObjective on transfer.
     objectives: HashSet<String>,
-    /// 리소스팩 서빙 중(프록시가 다운스트림 ResourcePacksInfo 를 프록시 팩으로 대체함).
-    /// 이후 클라 RP 응답을 프록시가 처리하고, 다운스트림엔 HAVE_ALL/COMPLETED 로 답한다.
+    /// Resource pack serving is active (proxy has replaced the downstream ResourcePacksInfo with its own pack list).
+    /// Client RP responses are handled by the proxy; the downstream receives HAVE_ALL/COMPLETED.
     rp_serving: bool,
 }
 
 impl SessionState {
-    /// 캡처된 Login 패킷(있으면). 전환 로직이 새 다운스트림에 리플레이할 때 사용.
+    /// Returns the captured Login packet, if any. Used by transfer logic to replay to a new downstream.
     pub fn captured_login(&self) -> Option<&[u8]> {
         self.captured_login.as_deref()
     }
 
-    /// 추적된 보스바/스코어보드를 비우고 반환(전환 시 옛 서버 잔재 teardown 용).
+    /// Drains and returns tracked boss bars and scoreboard objectives (used to tear down the previous server's state on transfer).
     pub fn take_tracked(&mut self) -> (Vec<i64>, Vec<String>) {
         let bossbars = self.bossbars.drain().collect();
         let objectives = self.objectives.drain().collect();
         (bossbars, objectives)
     }
 
-    /// 새 서버 초기 상태로 추적 세트를 시드한다(전환 후 다음 전환 대비).
+    /// Seeds the tracking sets with the new server's initial state (in preparation for the next transfer).
     pub fn seed_tracked(&mut self, bossbars: Vec<i64>, objectives: Vec<String>) {
         self.bossbars = bossbars.into_iter().collect();
         self.objectives = objectives.into_iter().collect();
     }
 }
 
-/// up(클라→서버) 메시지 인터셉션. ① Login 1회 캡처(전환 리플레이용) ② 리소스팩 서빙 중이면
-/// 클라 RP 응답(SEND_PACKS/HAVE_ALL/COMPLETED)·청크요청을 프록시가 처리. 그 외엔 Forward(→서버).
-/// 디코드 실패 시 Forward 폴백.
+/// Intercepts up (client→server) messages. ① Captures the Login packet once (for transfer replay).
+/// ② While serving resource packs, handles client RP responses (SEND_PACKS/HAVE_ALL/COMPLETED)
+/// and chunk requests directly in the proxy. Everything else is forwarded to the server.
+/// Falls back to Forward on decode failure.
 pub fn intercept_up(state: &mut SessionState, msg: &[u8], packs: Option<&PackStore>) -> Outcome {
     if msg.first() != Some(&GAME_PACKET) {
         return Outcome::Forward;
@@ -107,14 +110,14 @@ pub fn intercept_up(state: &mut SessionState, msg: &[u8], packs: Option<&PackSto
     match try_intercept_up(state, msg, packs) {
         Ok(o) => o,
         Err(e) => {
-            tracing::debug!("up 디코드 실패(원본 전달): {e}");
+            tracing::debug!("up decode failed (forwarding original): {e}");
             Outcome::Forward
         }
     }
 }
 
 fn try_intercept_up(state: &mut SessionState, msg: &[u8], packs: Option<&PackStore>) -> Result<Outcome> {
-    // RP 서빙도 아니고 Login 도 이미 잡았으면 디코드 불필요 → 불투명 통과(핫패스 보호).
+    // Not serving RP and Login already captured — no decode needed; pass through opaquely (hot-path guard).
     let need_rp = packs.is_some() && state.rp_serving;
     if state.captured_login.is_some() && !need_rp {
         return Ok(Outcome::Forward);
@@ -132,20 +135,20 @@ fn try_intercept_up(state: &mut SessionState, msg: &[u8], packs: Option<&PackSto
     let batch = compression::decompress(comp_type, batch_data)?;
     let pkts = split_batch(&batch)?;
 
-    // Login 1회 캡처.
+    // Capture Login once.
     if state.captured_login.is_none() {
         for p in &pkts {
             if peek_packet_id(p).ok() == Some(ID_LOGIN) {
                 state.captured_login = Some(p.to_vec());
-                tracing::info!(bytes = p.len(), "클라 Login 캡처 완료 (전환 리플레이용)");
+                tracing::info!(bytes = p.len(), "client Login captured (for transfer replay)");
                 break;
             }
         }
     }
 
-    // 리소스팩 중개: 서빙 중이면 클라 RP 패킷을 프록시가 처리하고 배치를 삼킨다.
+    // Resource pack brokering: while serving, the proxy handles client RP packets and consumes the batch.
     if need_rp {
-        let store = packs.expect("need_rp 면 packs Some");
+        let store = packs.expect("need_rp implies packs is Some");
         let mut to_client_raw: Vec<Vec<u8>> = Vec::new();
         let mut to_server_raw: Vec<Vec<u8>> = Vec::new();
         let mut handled = false;
@@ -175,7 +178,7 @@ fn try_intercept_up(state: &mut SessionState, msg: &[u8], packs: Option<&PackSto
     Ok(Outcome::Forward)
 }
 
-/// 클라 ResourcePackClientResponse 처리 → 클라/서버로 보낼 raw 패킷을 채운다.
+/// Handles a client ResourcePackClientResponse, populating raw packets to send to the client and/or server.
 fn handle_rp_response(
     store: &PackStore,
     pkt: &[u8],
@@ -187,7 +190,7 @@ fn handle_rp_response(
     };
     match status {
         RP_STATUS_SEND_PACKS => {
-            // 요청한 각 팩("uuid_version")에 DataInfo 전송.
+            // Send DataInfo for each requested pack ("uuid_version").
             let mut served = 0;
             for id in &ids {
                 let uuid = id.split('_').next().unwrap_or(id);
@@ -195,71 +198,72 @@ fn handle_rp_response(
                     to_client.push(PackStore::data_info_packet(pack));
                     served += 1;
                 } else {
-                    tracing::warn!(%uuid, "RP SEND_PACKS: 알 수 없는 팩 요청");
+                    tracing::warn!(%uuid, "RP SEND_PACKS: unknown pack requested");
                 }
             }
-            tracing::info!(requested = ids.len(), served, "RP SEND_PACKS → DataInfo 전송");
+            tracing::info!(requested = ids.len(), served, "RP SEND_PACKS → sending DataInfo");
         }
         RP_STATUS_HAVE_ALL_PACKS => {
-            // 다운로드 완료 → 프록시 스택 전송(팩 활성화).
+            // Download complete → send the proxy stack packet (activates packs).
             to_client.push(store.stack_packet.clone());
-            tracing::info!("RP HAVE_ALL → 프록시 스택 전송");
+            tracing::info!("RP HAVE_ALL → sending proxy stack");
         }
         RP_STATUS_COMPLETED => {
-            // 클라 RP 끝 → 다운스트림에 HAVE_ALL_PACKS 로 응답(다운스트림 RP 진행 트리거).
+            // Client RP done → acknowledge downstream with HAVE_ALL_PACKS to continue its RP flow.
             to_server.push(packets::resource_pack_client_response(RP_STATUS_HAVE_ALL_PACKS));
-            tracing::info!("RP COMPLETED → 다운스트림에 HAVE_ALL 응답");
+            tracing::info!("RP COMPLETED → sending HAVE_ALL to downstream");
         }
         RP_STATUS_REFUSED => {
-            tracing::warn!("클라가 리소스팩 거부 — 다운스트림 진행");
+            tracing::warn!("client refused resource packs — continuing downstream");
             to_server.push(packets::resource_pack_client_response(RP_STATUS_HAVE_ALL_PACKS));
         }
-        other => tracing::warn!(other, "알 수 없는 RP status"),
+        other => tracing::warn!(other, "unknown RP status"),
     }
 }
 
-/// 클라 ResourcePackChunkRequest 처리 → ChunkData 패킷(raw) 반환.
+/// Handles a client ResourcePackChunkRequest and returns a raw ChunkData packet.
 fn handle_chunk_request(store: &PackStore, pkt: &[u8]) -> Option<Vec<u8>> {
     let (uuid, idx) = crate::packs::parse_chunk_request(pkt)?;
     let Some(pack) = store.find(&uuid) else {
-        tracing::warn!(%uuid, "RP ChunkRequest: 알 수 없는 팩");
+        tracing::warn!(%uuid, "RP ChunkRequest: unknown pack");
         return None;
     };
     let offset = idx as u64 * crate::packs::CHUNK_SIZE as u64;
     let start = offset as usize;
     if start >= pack.bytes.len() {
-        tracing::warn!(%uuid, idx, "RP ChunkRequest 범위 초과");
+        tracing::warn!(%uuid, idx, "RP ChunkRequest out of range");
         return None;
     }
     let end = (start + crate::packs::CHUNK_SIZE as usize).min(pack.bytes.len());
-    tracing::debug!(%uuid, idx, len = end - start, "RP ChunkData 전송");
+    tracing::debug!(%uuid, idx, len = end - start, "RP ChunkData sending");
     Some(PackStore::chunk_data_packet(&pack.uuid_str, idx, offset, &pack.bytes[start..end]))
 }
 
-/// raw 패킷들을 게임패킷 메시지(zlib 압축)로 프레이밍. (RP 단계는 NetworkSettings 이후라 압축 ON)
+/// Frames raw packets into a game-packet message (zlib compressed). The RP phase is post-NetworkSettings so compression is always on.
 fn frame_all(raw: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
     raw.iter()
         .map(|p| packets::frame_game_packet(p, true, compression::ZLIB))
         .collect()
 }
 
-/// 인터셉션 결과 (up/down 공용). Forward/Replace 의 "반대편"은 방향에 따라 결정된다
-/// (up → 서버, down → 클라). Inject 는 명시적으로 양쪽에 보낸다(원본은 버림).
+/// Interception result (shared by up and down paths). The "other side" for Forward/Replace
+/// is direction-dependent (up → server, down → client). Inject explicitly addresses both sides
+/// and discards the original.
 pub enum Outcome {
-    /// 원본 그대로 반대편으로 전달.
+    /// Forward the original message to the other side unchanged.
     Forward,
-    /// 수정본을 반대편으로 전달.
+    /// Forward a modified message to the other side.
     Replace(Vec<u8>),
-    /// 원본을 버리고 지정한 메시지들을 각각 클라/서버로 보낸다(리소스팩 중개 등).
+    /// Discard the original and send the specified messages to the client and/or server (e.g. resource pack brokering).
     Inject {
         to_client: Vec<Vec<u8>>,
         to_server: Vec<Vec<u8>>,
     },
-    /// (down 전용) 채널이동 트리거 — 대상 서버명. 원본은 클라로 안 보냄.
+    /// (down only) Transfer trigger — target server name. The original is not forwarded to the client.
     Transfer(String),
 }
 
-/// down 메시지를 검사한다. 디코드 실패 시 `Forward`(원본 전달)로 폴백해 연결을 보호한다.
+/// Inspects a down message. Falls back to `Forward` (pass original) on decode failure to protect the connection.
 pub fn intercept_down(
     state: &mut SessionState,
     msg: &[u8],
@@ -274,10 +278,10 @@ pub fn intercept_down(
     let watching_vv = force_vv && !state.vv_done;
     let rp_active = packs.is_some();
     if !watching_vv && !channel_transfer && !rp_active {
-        return Outcome::Forward; // 볼 게 없음 → 완전 불투명
+        return Outcome::Forward; // nothing to watch → fully opaque
     }
 
-    // VV flip 단계가 끝나면 작은 배치만 디코드(청크 회피). transfer/RP 패킷은 작다.
+    // After VV flip, only decode small batches (avoids chunk overhead). Transfer/RP packets are small.
     if !watching_vv {
         let payload = &msg[1..];
         let data_len = if state.compression_on {
@@ -293,7 +297,7 @@ pub fn intercept_down(
     match try_intercept(state, msg, watching_vv, channel_transfer, packs) {
         Ok(outcome) => outcome,
         Err(e) => {
-            tracing::debug!("down 디코드 실패(원본 전달): {e}");
+            tracing::debug!("down decode failed (forwarding original): {e}");
             Outcome::Forward
         }
     }
@@ -328,20 +332,20 @@ fn try_intercept(
     let mut rp_stack_seen = false;
     for (i, p) in packets.iter().enumerate() {
         let Ok(id) = peek_packet_id(p) else { continue };
-        // 핫패스 fast-reject: 관심 ID bitmap 1회 조회로 대다수(이동/엔티티 등) 패킷을 즉시 통과.
-        // 관심 패킷 ID 는 전부 <256. 범위 밖(256+) ID 는 우리가 안 건드리므로 바운드체크로 통과(panic 방지).
+        // Hot-path fast-reject: single bitmap lookup passes most packets (movement, entity, etc.) immediately.
+        // All interesting IDs are <256. IDs outside that range are not our concern; bounds check passes them (panic-safe).
         let idx = id as usize;
         if idx >= DOWN_INTEREST.len() || !DOWN_INTEREST[idx] {
             continue;
         }
         match id {
             ID_NETWORK_SETTINGS => saw_network_settings = true,
-            // RP 서빙: 다운스트림 ResourcePacksInfo 는 프록시 팩으로 대체(VV flip 보다 우선).
+            // RP serving: replace downstream ResourcePacksInfo with proxy packs (takes priority over VV flip).
             ID_RESOURCE_PACKS_INFO if packs.is_some() => rp_info_seen = true,
             ID_RESOURCE_PACKS_INFO if watching_vv => vv_idx = Some(i),
             ID_RESOURCE_PACK_STACK if state.rp_serving => rp_stack_seen = true,
             ID_TRANSFER if channel_transfer => transfer_idx = Some(i),
-            // 전환 teardown 대비 상태 추적 (보스바/스코어보드 — 작은 패킷이라 디코드 비용 미미).
+            // Track state for transfer teardown (boss bars/scoreboards — small packets, decode cost is negligible).
             packets::ID_BOSS_EVENT if channel_transfer => {
                 if let Some((bid, ev)) = packets::parse_boss_event(p) {
                     if ev == packets::BOSS_EVENT_TYPE_SHOW {
@@ -369,19 +373,19 @@ fn try_intercept(
         state.compression_on = true;
     }
 
-    // TransferPacket 우선 — 전환은 곧 연결을 바꾸므로 같은 배치의 다른 처리보다 우선.
+    // TransferPacket takes priority — a transfer replaces the connection, so it wins over other processing in the same batch.
     if let Some(idx) = transfer_idx {
         if let Ok(server) = read_transfer_address(packets[idx]) {
             return Ok(Outcome::Transfer(server));
         }
     }
 
-    // RP 서빙 시작: 배치 내 ResourcePacksInfo 패킷만 프록시 info 로 교체하고 나머지 패킷
-    // (PlayStatus(LOGIN_SUCCESS) 등)은 보존한다. 다운스트림엔 아직 응답 안 함(HOLD).
+    // Start RP serving: replace only the ResourcePacksInfo packet in the batch with the proxy info packet;
+    // preserve other packets in the batch (e.g. PlayStatus(LOGIN_SUCCESS)). No downstream response yet (HOLD).
     if rp_info_seen {
         if let Some(store) = packs {
             state.rp_serving = true;
-            state.vv_done = true; // 프록시 info 가 forceDisableVibrantVisuals=0 이라 VV flip 불필요
+            state.vv_done = true; // proxy info has forceDisableVibrantVisuals=0 so VV flip is unnecessary
             let mut owned: Vec<Vec<u8>> = packets.iter().map(|p| p.to_vec()).collect();
             let mut others = 0usize;
             for pkt in owned.iter_mut() {
@@ -399,12 +403,12 @@ fn try_intercept(
                 out.push(comp_type);
             }
             out.extend_from_slice(&recompressed);
-            tracing::info!(packs = store.packs.len(), batch_others = others, "리소스팩 서빙 시작 — 다운스트림 info 대체(배치 보존)");
+            tracing::info!(packs = store.packs.len(), batch_others = others, "resource pack serving started — replaced downstream info (batch preserved)");
             return Ok(Outcome::Replace(out));
         }
     }
 
-    // RP 다운스트림 Stack: 클라엔 안 보내고(프록시 스택 이미 전송) 다운스트림에 COMPLETED 응답 → 진행.
+    // RP downstream Stack: do not forward to client (proxy stack already sent); respond to downstream with COMPLETED to advance.
     if rp_stack_seen {
         let completed = packets::frame_game_packet(
             &packets::resource_pack_client_response(RP_STATUS_COMPLETED),
@@ -425,7 +429,7 @@ fn try_intercept(
         if !flipped {
             return Ok(Outcome::Forward);
         }
-        tracing::info!("Vibrant Visuals 강제비활성 플래그 해제 (VV 활성화)");
+        tracing::info!("Vibrant Visuals force-disable flag cleared (VV enabled)");
         let new_batch = build_batch(&owned);
         let recompressed = compression::compress(comp_type, &new_batch)?;
         let mut out = Vec::with_capacity(2 + recompressed.len());
@@ -441,7 +445,7 @@ fn try_intercept(
 }
 
 /// TransferPacket: `[header VarInt][address: VarInt-len + bytes][port LE u16][reloadWorld 1]`.
-/// address(대상 서버명) 문자열을 읽는다.
+/// Reads the address (target server name) string.
 fn read_transfer_address(packet: &[u8]) -> Result<String> {
     let (_, header_len) = read_varint_u32(packet)?;
     let rest = &packet[header_len..];
@@ -449,13 +453,13 @@ fn read_transfer_address(packet: &[u8]) -> Result<String> {
     let start = consumed;
     let end = start + str_len as usize;
     if end > rest.len() {
-        anyhow::bail!("transfer address 길이 초과");
+        anyhow::bail!("transfer address length overflow");
     }
     Ok(String::from_utf8_lossy(&rest[start..end]).into_owned())
 }
 
-/// ResourcePacksInfoPacket 의 `forceDisableVibrantVisuals`(헤더 다음 4번째 bool)를 false 로.
-/// 레이아웃: `[header VarInt][mustAccept][hasAddons][hasScripts][forceDisableVibrantVisuals]...`
+/// Sets `forceDisableVibrantVisuals` (4th bool after the header) to false in a ResourcePacksInfoPacket.
+/// Layout: `[header VarInt][mustAccept][hasAddons][hasScripts][forceDisableVibrantVisuals]...`
 fn flip_vibrant_visuals(packet: &mut [u8]) -> bool {
     let Ok((_, header_len)) = read_varint_u32(packet) else {
         return false;
@@ -523,30 +527,30 @@ mod tests {
     fn rp_replaces_downstream_info_then_responds_on_completed() {
         let store = dummy_store();
         let mut state = SessionState::default();
-        // 다운스트림 ResourcePacksInfo → 프록시 info 로 대체 + rp_serving 설정.
+        // Downstream ResourcePacksInfo → replaced with proxy info + rp_serving set.
         let info_msg = frame_uncompressed(&[make_resource_packs_info(1)]);
         match intercept_down(&mut state, &info_msg, true, true, Some(&store)) {
             Outcome::Replace(_) => {}
-            _ => panic!("RP info 대체(Replace) 기대"),
+            _ => panic!("expected Replace for RP info substitution"),
         }
         assert!(state.rp_serving);
 
-        // 클라 COMPLETED → 다운스트림에 HAVE_ALL 응답(Inject to_server 비어있지 않음).
+        // Client COMPLETED → downstream receives HAVE_ALL (Inject to_server non-empty).
         let resp = frame_uncompressed(&[make_rp_response(RP_STATUS_COMPLETED)]);
         match intercept_up(&mut state, &resp, Some(&store)) {
             Outcome::Inject { to_server, .. } => assert!(!to_server.is_empty()),
-            _ => panic!("COMPLETED 시 다운스트림 응답(Inject) 기대"),
+            _ => panic!("expected Inject with downstream response on COMPLETED"),
         }
     }
 
     #[test]
     fn rp_disabled_keeps_vv_flip() {
-        // packs None 이면 기존 VV flip 경로 유지(rp_serving 안 됨).
+        // With packs = None, the existing VV flip path is used (rp_serving stays false).
         let mut state = SessionState::default();
         let msg = frame_uncompressed(&[make_resource_packs_info(1)]);
         match intercept_down(&mut state, &msg, true, true, None) {
             Outcome::Replace(_) => {}
-            _ => panic!("VV flip Replace 기대"),
+            _ => panic!("expected Replace for VV flip"),
         }
         assert!(!state.rp_serving);
     }
@@ -557,7 +561,7 @@ mod tests {
         let msg = frame_uncompressed(&[make_transfer("island1")]);
         match intercept_down(&mut state, &msg, true, true, None) {
             Outcome::Transfer(s) => assert_eq!(s, "island1"),
-            _ => panic!("Transfer 가 감지돼야 함"),
+            _ => panic!("expected Transfer to be detected"),
         }
     }
 
@@ -571,7 +575,7 @@ mod tests {
                 let (_, hl) = read_varint_u32(packets[0]).unwrap();
                 assert_eq!(packets[0][hl + 3], 0);
             }
-            _ => panic!("VV flip 수정본이 나와야 함"),
+            _ => panic!("expected Replace with VV-flipped output"),
         }
         assert!(state.vv_done);
     }
@@ -579,7 +583,7 @@ mod tests {
     #[test]
     fn large_batch_skipped_when_only_transfer_watching() {
         let mut state = SessionState { compression_on: true, vv_done: true, ..Default::default() };
-        // 큰 배치 = 청크로 간주, 디코드 스킵 → Forward
+        // Large batch treated as chunk data; decode skipped → Forward
         let big = vec![GAME_PACKET; TRANSFER_SCAN_MAX + 100];
         assert!(matches!(
             intercept_down(&mut state, &big, true, true, None),
@@ -599,12 +603,12 @@ mod tests {
 
     #[test]
     fn transfer_still_watched_after_vv_done() {
-        // vv_done 이어도 transfer 는 계속 감시(작은 배치).
+        // Transfer is still watched after vv_done (small batches only).
         let mut state = SessionState { compression_on: false, vv_done: true, ..Default::default() };
         let msg = frame_uncompressed(&[make_transfer("spawn2")]);
         match intercept_down(&mut state, &msg, true, true, None) {
             Outcome::Transfer(s) => assert_eq!(s, "spawn2"),
-            _ => panic!("vv_done 후에도 transfer 감지돼야 함"),
+            _ => panic!("expected transfer to be detected even after vv_done"),
         }
     }
 
@@ -639,7 +643,7 @@ mod tests {
         let mut state = SessionState::default();
         let first = make_login(b"first");
         let _ = intercept_up(&mut state, &frame_uncompressed(&[first.clone()]), None);
-        // 이후 다른 Login 은 무시(최초 1회만).
+        // Subsequent Login packets are ignored (captured only once).
         let _ = intercept_up(&mut state, &frame_uncompressed(&[make_login(b"second-different")]), None);
         assert_eq!(state.captured_login(), Some(first.as_slice()));
     }
@@ -647,7 +651,7 @@ mod tests {
     #[test]
     fn ignores_non_login_up_packets() {
         let mut state = SessionState::default();
-        // RequestNetworkSettings(0xc1) 같은 비-Login 은 캡처 안 함.
+        // Non-Login packets such as RequestNetworkSettings (0xc1) are not captured.
         let mut req = Vec::new();
         write_varint_u32(0xc1, &mut req);
         req.extend_from_slice(&[0, 0, 0, 0]);

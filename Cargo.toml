@@ -2,7 +2,7 @@
 name = "rift"
 version = "0.0.1"
 edition = "2021"
-description = "고성능 경량 Minecraft Bedrock 프록시 (Waterdog 대체 목표) — Phase 0: 투명 UDP 릴레이"
+description = "High-performance lightweight Minecraft Bedrock proxy (Waterdog replacement goal) — Phase 0: transparent UDP relay"
 
 [[bin]]
 name = "rift"
@@ -10,26 +10,26 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "sync", "signal"] }
-# vendored + patched: ACK 배칭 (per-datagram → 50ms tick). docs/phase1b-design.md 참고.
+# vendored + patched: ACK batching (per-datagram → 50ms tick). See docs/phase1b-design.md.
 rift-raknet = { path = "vendor/rift-raknet" }
-# Phase 1b — Bedrock 패킷 암호화 (AES-256-CTR "fake GCM")
+# Phase 1b — Bedrock packet encryption (AES-256-CTR "fake GCM")
 aes = "0.8"
 ctr = "0.9"
 sha2 = "0.10"
-# Phase 1b — P-384 키 (ECDH 공유비밀 + ECDSA/ES384 JWT 서명, 같은 키 사용)
+# Phase 1b — P-384 key (ECDH shared secret + ECDSA/ES384 JWT signing, same key pair)
 p384 = { version = "0.13", features = ["ecdh", "ecdsa", "pkcs8"] }
 rand = "0.8"
-# Phase 1b — Bedrock 로그인/핸드셰이크 JWT (ES384, x5u=DER 공개키)
+# Phase 1b — Bedrock login/handshake JWT (ES384, x5u=DER public key)
 base64 = "0.22"
 serde_json = "1"
-# Phase 1b — 배치 압축. zlib는 RAW DEFLATE(헤더 없음, PMMP ZLIB_ENCODING_RAW), snappy는 raw 블록.
+# Phase 1b — batch compression. zlib uses RAW DEFLATE (no header, PMMP ZLIB_ENCODING_RAW); snappy uses raw blocks.
 flate2 = "1"
 snap = "1"
-# 성능 — 전역 할당자 (Rust 기본보다 빠른 경우 多). docs/performance.md #12.
-# optional: 유일한 C 의존성. musl 정적 빌드(deploy-anywhere)는 --no-default-features 로 빼면
-# musl-gcc 없이 순수 Rust 정적 링크 가능. 일반 빌드는 default 로 mimalloc 켜짐.
+# Performance — global allocator (often faster than Rust's default). docs/performance.md #12.
+# optional: the only C dependency. For musl static builds (deploy-anywhere), pass --no-default-features
+# to drop it and get a pure-Rust static link without musl-gcc. Regular builds enable mimalloc by default.
 mimalloc = { version = "0.1", optional = true }
-# 리소스팩 서빙 — .mcpack/.zip 안의 manifest.json 읽기 (uuid/version 추출).
+# Resource pack serving — reads manifest.json inside .mcpack/.zip files (extracts uuid/version).
 zip = { version = "2", default-features = false, features = ["deflate"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
@@ -38,11 +38,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [features]
-# 기본: mimalloc 전역 할당자 사용. musl 정적 빌드 시 --no-default-features 로 끄면
-# C 의존성이 사라져 musl-gcc 없이 순수 Rust 정적 링크가 된다(할당자는 system).
+# default: uses the mimalloc global allocator. Disable with --no-default-features for musl static builds —
+# removes the C dependency and produces a pure-Rust static binary (falls back to the system allocator).
 default = ["mimalloc"]
-# 측정 빌드: 카운팅 할당자로 alloc 횟수/바이트를 /metrics 에 노출(Hot Path Allocation=0 검증).
-# 프로덕션은 끔 — 오버헤드 0. 예: cargo build --release --features profiling
+# Instrumented build: exposes alloc count/bytes via /metrics using a counting allocator (verifies Hot Path Allocation=0).
+# Disabled in production — zero overhead. Example: cargo build --release --features profiling
 profiling = []
 
 [profile.release]
@@ -50,11 +50,11 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 panic = "abort"
-strip = true        # 디버그 심볼 제거 → 릴리스 바이너리 크기 감소
+strip = true        # Strip debug symbols to reduce release binary size
 
-# 프로파일링 빌드: 릴리스와 동일 최적화 + 심볼 유지(strip=false, debug 정보).
-# perf/flamegraph 로 "어느 함수가 핫한지" 보려면 이 빌드로 떠야 한다.
-#   cargo build --profile profiling   → target/profiling/rift (심볼 포함)
+# Profiling build: same optimizations as release but retains symbols (strip=false, debug info).
+# Use this build with perf/flamegraph to identify hot functions.
+#   cargo build --profile profiling   → target/profiling/rift  (symbols included)
 [profile.profiling]
 inherits = "release"
 debug = true

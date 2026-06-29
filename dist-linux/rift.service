@@ -1,25 +1,25 @@
 [Unit]
-Description=Rift (Bedrock 프록시)
+Description=Rift (Bedrock proxy)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-# ── 배포 경로에 맞게 수정 ──
+# ── Update path to match your deploy location ──
 WorkingDirectory=/opt/rift
 ExecStart=/opt/rift/rift-musl /opt/rift/config.toml
-# 비정상 종료 시 자동 재시작
+# Automatically restart on unexpected exit
 Restart=on-failure
 RestartSec=3
-# 로그는 journald 로 → journalctl -u rift -f
+# Logs are sent to journald → journalctl -u rift -f
 StandardOutput=journal
 StandardError=journal
 Environment=RUST_LOG=rift=info
-# UDP 다수 연결 대비 파일 디스크립터 상향
+# Raise the file-descriptor limit for high UDP connection counts
 LimitNOFILE=65536
 
-# ※ systemd 모드에선 stdin 이 없어 콘솔 명령(transfer/kick/stop) 입력 불가.
-#   → 웹 대시보드(:8080) + systemctl 로 관리. 콘솔 명령이 필요하면 screen/tmux 로 실행.
+# Note: stdin is not available in systemd mode, so console commands (transfer/kick/stop) cannot be used.
+#   → Manage via the web dashboard (:8080) and systemctl. Use screen/tmux if you need console commands.
 
 [Install]
 WantedBy=multi-user.target

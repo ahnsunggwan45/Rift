@@ -1,17 +1,17 @@
-//! 새 다운스트림 핸드셰이크 드라이버 — 채널이동 시 프록시가 클라 행세로 로그인 구동.
+//! New downstream handshake driver — on transfer, the proxy impersonates the client to drive login.
 //!
-//! 클라는 이미 첫 서버에 로그인 완료 상태라, 새 서버(B)의 로그인 핸드셰이크는
-//! 프록시가 직접 수행한다(저장한 클라 Login 리플레이). 평문 A모드(enable-encryption=false)
-//! 라 암호화 핸드셰이크는 없다.
+//! The client is already fully logged in to the first server, so the proxy drives the login
+//! handshake with the new server (B) itself by replaying the stored client Login packet.
+//! Plaintext mode A (enable-encryption=false) means no encryption handshake is required.
 //!
-//! 시퀀스:
-//!   RequestNetworkSettings → NetworkSettings → Login(리플레이)
+//! Sequence:
+//!   RequestNetworkSettings → NetworkSettings → Login (replay)
 //!     → ResourcePacksInfo → [HAVE_ALL_PACKS] → ResourcePackStack → [COMPLETED]
-//!     → StartGame (runtime_id/스폰위치 추출) → [RequestChunkRadius] → 스폰 스트림 버퍼링
-//!     → PlayStatus(PLAYER_SPAWN) (준비 완료)
+//!     → StartGame (extract runtime_id / spawn position) → [RequestChunkRadius] → buffer spawn stream
+//!     → PlayStatus(PLAYER_SPAWN) (ready)
 //!
-//! StartGame 에서 멈추지 않고 RequestChunkRadius 를 보내 새 서버가 청크를 스트리밍하게
-//! 하고, 그 스트림(StartGame 제외)을 버퍼에 모은다. 전환 후 클라에 재생한다.
+//! After StartGame, the proxy sends RequestChunkRadius so the new server begins streaming chunks.
+//! That stream (excluding StartGame) is buffered and replayed to the client after the transfer.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -36,28 +36,28 @@ const ID_DISCONNECT: u32 = 0x05;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const RECV_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// 핸드셰이크 + 스폰까지 완료된 새 다운스트림.
+/// A new downstream that has completed handshake and spawn.
 pub struct ReadyDownstream {
     pub socket: RaknetSocket,
-    /// 새 서버가 부여한 플레이어 runtime entity id.
-    /// (결정론 ID 플러그인 덕에 클라가 인식 중인 값과 동일 — 재작성 불필요.)
+    /// Player runtime entity ID assigned by the new server.
+    /// (Matches the value the client already knows, thanks to the deterministic ID plugin — no rewriting needed.)
     pub runtime_id: u64,
-    /// 새 서버의 스폰 위치 [x,y,z] (디멘션 전환 시 클라 위치).
+    /// Spawn position [x,y,z] on the new server (client position after a dimension transfer).
     pub spawn_pos: [f32; 3],
-    /// 새 서버의 playerGamemode. 전환 후 SetPlayerGameType 으로 클라 HUD 동기화.
+    /// Player gamemode on the new server. Sent as SetPlayerGameType after transfer to sync the client HUD.
     pub gamemode: i32,
-    /// 새 서버 StartGame 패킷(압축 해제된 바이트). 게임룰 등 추출용.
+    /// Raw StartGame packet bytes (decompressed) from the new server. Used to extract game rules, etc.
     pub start_game: Vec<u8>,
-    /// 새 서버가 스폰 스트림에서 띄운 보스바/스코어보드(전환 후 다음 전환 대비 추적 시드).
+    /// Boss bars and scoreboard objectives raised during the spawn stream (seed for the next transfer's teardown).
     pub bossbars: Vec<i64>,
     pub objectives: Vec<String>,
-    /// StartGame 직후부터 PlayStatus(PLAYER_SPAWN) 까지 새 서버가 보낸 스폰 스트림
-    /// (StartGame 패킷만 제외한 원본 게임패킷 메시지들). 클라 전환 후 그대로 재생해
-    /// 청크/인벤토리/엔티티를 채운다 — 이게 없으면 클라가 빈 월드에 떨어진다(0-청크 버그).
+    /// Spawn stream messages sent by the new server from StartGame through PlayStatus(PLAYER_SPAWN),
+    /// excluding the StartGame packet itself. Replayed to the client after the transfer to populate
+    /// chunks, inventory, and entities — without this the client lands in an empty world (0-chunk bug).
     pub spawn_buffer: Vec<Vec<u8>>,
 }
 
-/// 새 다운스트림에 연결하고 클라 로그인 핸드셰이크를 구동한다. StartGame 까지 받으면 완료.
+/// Connects to a new downstream and drives the client login handshake. Completes when StartGame is received.
 pub async fn connect_and_handshake(
     addr: SocketAddr,
     raknet_version: u8,
@@ -65,18 +65,18 @@ pub async fn connect_and_handshake(
 ) -> Result<ReadyDownstream> {
     match timeout(HANDSHAKE_TIMEOUT, drive(addr, raknet_version, login_packet)).await {
         Ok(r) => r,
-        Err(_) => bail!("다운스트림 핸드셰이크 타임아웃 ({addr})"),
+        Err(_) => bail!("downstream handshake timed out ({addr})"),
     }
 }
 
 async fn drive(addr: SocketAddr, raknet_version: u8, login_packet: &[u8]) -> Result<ReadyDownstream> {
     let socket = RaknetSocket::connect_with_version(&addr, raknet_version)
         .await
-        .map_err(|e| anyhow!("RakNet 연결 실패 {addr}: {e:?}"))?;
+        .map_err(|e| anyhow!("RakNet connection failed {addr}: {e:?}"))?;
 
     let protocol = packets::extract_login_protocol(login_packet)?;
 
-    // 1) RequestNetworkSettings (비압축)
+    // 1) RequestNetworkSettings (uncompressed)
     let req = packets::frame_game_packet(
         &packets::request_network_settings(protocol),
         false,
@@ -91,7 +91,7 @@ async fn drive(addr: SocketAddr, raknet_version: u8, login_packet: &[u8]) -> Res
     let mut gamemode: i32 = 0;
     let mut start_game_bytes: Vec<u8> = Vec::new();
     let mut spawn_buffer: Vec<Vec<u8>> = Vec::new();
-    // 새 서버 초기 보스바/스코어보드 추적(전환 후 다음 전환 teardown 시드용).
+    // Track boss bars and scoreboard objectives on the new server (seed for the next transfer's teardown).
     let mut track_bossbars: HashSet<i64> = HashSet::new();
     let mut track_objectives: HashSet<String> = HashSet::new();
 
@@ -117,7 +117,7 @@ async fn drive(addr: SocketAddr, raknet_version: u8, login_packet: &[u8]) -> Res
         for pkt in &pkts {
             match peek_packet_id(pkt)? {
                 ID_NETWORK_SETTINGS => {
-                    // 이후 압축 ON. 우리 송신은 zlib 로(서버가 압축타입 바이트로 판별).
+                    // Compression enabled from here on. We send with zlib (server identifies type by the compression-type byte).
                     compression_on = true;
                     let login_msg =
                         packets::frame_game_packet(login_packet, true, compression::ZLIB)?;
@@ -147,8 +147,8 @@ async fn drive(addr: SocketAddr, raknet_version: u8, login_packet: &[u8]) -> Res
                     start_game_bytes = pkt.to_vec();
                     got_start_game = true;
                     start_game_here = true;
-                    // ★ 청크 스트리밍 트리거. 이 RequestChunkRadius 가 없어서 새 서버가
-                    //   청크를 한 개도 안 보냈고(0-청크 버그), 핸드셰이크가 StartGame 에서 멈췄다.
+                    // ★ Chunk streaming trigger. Without this RequestChunkRadius the new server
+                    //   sent zero chunks (0-chunk bug) and the handshake stalled at StartGame.
                     let rcr = packets::frame_game_packet(
                         &packets::request_chunk_radius(8, 12),
                         true,
@@ -161,20 +161,20 @@ async fn drive(addr: SocketAddr, raknet_version: u8, login_packet: &[u8]) -> Res
                     if got_start_game && st == Some(packets::PLAY_STATUS_PLAYER_SPAWN) {
                         saw_player_spawn = true;
                     } else if let Some(s) = st {
-                        // 스폰 외 PlayStatus = 로그인 실패 코드일 수 있음(1/2=버전 불일치, 7=서버 가득 등). 진단.
-                        tracing::warn!(%addr, play_status = s, "핸드셰이크 중 비-스폰 PlayStatus");
+                        // Non-spawn PlayStatus may indicate a login failure code (1/2=version mismatch, 7=server full, etc.).
+                        tracing::warn!(%addr, play_status = s, "non-spawn PlayStatus during handshake");
                     }
                 }
                 ID_DISCONNECT => {
-                    // 다운스트림이 핸드셰이크 중 kick. 사유 문자열이 페이로드에 있어 lossy 로 찍어 진단한다.
+                    // Downstream kicked us during handshake. The reason string is in the payload; log it lossily for diagnostics.
                     let dump: String = String::from_utf8_lossy(pkt)
                         .chars()
                         .map(|c| if c.is_control() { ' ' } else { c })
                         .take(180)
                         .collect();
-                    tracing::warn!(%addr, raw = %dump.trim(), "다운스트림 Disconnect(kick) 수신 — raw 에 사유 포함");
+                    tracing::warn!(%addr, raw = %dump.trim(), "downstream Disconnect (kick) received — reason in raw payload");
                 }
-                // 새 서버 초기 보스바/스코어보드 추적.
+                // Track initial boss bars and scoreboard objectives on the new server.
                 packets::ID_BOSS_EVENT => {
                     if let Some((id, ev)) = packets::parse_boss_event(pkt) {
                         if ev == packets::BOSS_EVENT_TYPE_SHOW {
@@ -198,10 +198,10 @@ async fn drive(addr: SocketAddr, raknet_version: u8, login_packet: &[u8]) -> Res
             }
         }
 
-        // StartGame 이후의 스폰 스트림을 버퍼링(전환 후 클라에 재생).
+        // Buffer the spawn stream after StartGame (replayed to the client after transfer).
         if got_start_game {
             if start_game_here {
-                // StartGame 이 든 배치: StartGame 만 빼고 나머지(ItemRegistry/인벤/능력치 등)는 버퍼.
+                // Batch containing StartGame: keep everything except StartGame (ItemRegistry, inventory, stats, etc.).
                 let kept: Vec<Vec<u8>> = pkts
                     .iter()
                     .filter(|p| peek_packet_id(p).ok() != Some(ID_START_GAME))
@@ -211,7 +211,7 @@ async fn drive(addr: SocketAddr, raknet_version: u8, login_packet: &[u8]) -> Res
                     spawn_buffer.push(rebuild_message(&kept, compression_on, comp_type)?);
                 }
             } else {
-                // 순수 스폰 스트림(청크/퍼블리셔/엔티티/PlayStatus) — 원본 메시지 그대로 버퍼.
+                // Pure spawn stream (chunks, publisher, entities, PlayStatus) — buffer the original message as-is.
                 spawn_buffer.push(msg.clone());
             }
         }
@@ -231,8 +231,8 @@ async fn drive(addr: SocketAddr, raknet_version: u8, login_packet: &[u8]) -> Res
     }
 }
 
-/// 압축 해제된 패킷들을 다시 게임패킷 메시지(`[0xfe](+comp_type)[batch]`)로 묶는다.
-/// drive() 에서 StartGame 을 제거한 배치를 재구성할 때 사용.
+/// Reassembles decompressed packets into a game-packet message (`[0xfe](+comp_type)[batch]`).
+/// Used in drive() to reconstruct a batch with StartGame removed.
 fn rebuild_message(packets: &[Vec<u8>], compressed: bool, comp_type: u8) -> Result<Vec<u8>> {
     let batch = build_batch(packets);
     let mut out = vec![GAME_PACKET];
@@ -249,14 +249,14 @@ async fn raknet_send(socket: &RaknetSocket, msg: &[u8]) -> Result<()> {
     socket
         .send(msg, Reliability::ReliableOrdered)
         .await
-        .map_err(|e| anyhow!("다운스트림 send 실패: {e:?}"))
+        .map_err(|e| anyhow!("downstream send failed: {e:?}"))
 }
 
 async fn raknet_recv(socket: &RaknetSocket) -> Result<Vec<u8>> {
-    // 핸드셰이크 경로(핫패스 아님) — Bytes→Vec 1회 복사 수용. 릴레이 핫패스는 Bytes 그대로 사용.
+    // Handshake path (not hot path) — one Bytes→Vec copy is acceptable. The relay hot path uses Bytes directly.
     match timeout(RECV_TIMEOUT, socket.recv()).await {
         Ok(Ok(data)) => Ok(data.to_vec()),
-        Ok(Err(e)) => bail!("다운스트림 recv 실패: {e:?}"),
-        Err(_) => bail!("다운스트림 recv 타임아웃"),
+        Ok(Err(e)) => bail!("downstream recv failed: {e:?}"),
+        Err(_) => bail!("downstream recv timed out"),
     }
 }

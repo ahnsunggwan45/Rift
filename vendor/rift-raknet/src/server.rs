@@ -361,7 +361,7 @@ impl RaknetListener {
                             guid,
                             // Make sure this is false, it is vital for the login sequence to continue
                             use_encryption: 0x00,
-                            // see Open Connection Request 1 (Rift: MTU 캡 적용)
+                            // see Open Connection Request 1 (Rift: MTU cap applied)
                             mtu_size: crate::utils::mtu(),
                         };
 

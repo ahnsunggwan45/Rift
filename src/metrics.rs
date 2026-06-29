@@ -1,7 +1,8 @@
-//! 경량 메트릭 + 서버별 인원 집계.
+//! Lightweight metrics + per-server player count aggregation.
 //!
-//! "측정 기반 하드닝" 게이트: bolt-on 최적화(버퍼풀/샤딩 등) 전에 먼저 여기서 핫스팟을 본다.
-//! 핫패스 비용은 패킷당 AtomicU64 relaxed 가산 1회뿐(수 ns) — 무시 가능.
+//! Gate for measurement-driven hardening: identify hot spots here before applying
+//! bolt-on optimizations (buffer pools, sharding, etc.).
+//! Hot-path cost is a single AtomicU64 relaxed increment per packet (nanoseconds) — negligible.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
@@ -9,7 +10,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 pub struct Metrics {
-    /// 프로세스 시작 시각 (uptime 계산용).
+    /// Process start time (used to calculate uptime).
     start_time: Instant,
     connections_total: AtomicU64,
     active: AtomicUsize,
@@ -20,10 +21,10 @@ pub struct Metrics {
     msgs_down: AtomicU64,
     transfers: AtomicU64,
     transfers_failed: AtomicU64,
-    /// down 포워드 처리시간 누적(ns)+건수 → 평균 forward latency. 핫패스 비용은 Instant 2회(~수십 ns).
+    /// Cumulative downstream forward processing time (ns) + count → average forward latency. Hot-path cost: two `Instant` calls (~tens of ns).
     fwd_ns_total: AtomicU64,
     fwd_count: AtomicU64,
-    /// 서버명 → 현재 인원 (plist/모니터링 기반).
+    /// Server name → current player count (driven by plist/monitoring).
     per_server: RwLock<HashMap<String, usize>>,
 }
 
@@ -47,7 +48,7 @@ impl Default for Metrics {
     }
 }
 
-/// 웹 모니터링/콘솔용 메트릭 스냅샷 (JSON 직렬화).
+/// Metrics snapshot for web monitoring / console (JSON-serializable).
 #[derive(serde::Serialize)]
 pub struct MetricsSnapshot {
     pub uptime_secs: u64,
@@ -60,11 +61,11 @@ pub struct MetricsSnapshot {
     pub bytes_down: u64,
     pub msgs_up: u64,
     pub msgs_down: u64,
-    /// 평균 패킷 크기(bytes) = 총 bytes / 총 msgs.
+    /// Average packet size in bytes = total bytes / total messages.
     pub avg_packet_size_bytes: u64,
-    /// 평균 down 포워드 latency(μs). 평소 수~수십 μs, 스파이크 시 다운스트림/경합 신호.
+    /// Average downstream forward latency in μs. Typically a few to tens of μs; spikes signal downstream or contention issues.
     pub avg_forward_us: u64,
-    /// 누적 할당 횟수/바이트. profiling 빌드(--features profiling)에서만 >0, 평시 0.
+    /// Cumulative allocation count/bytes. Non-zero only in profiling builds (`--features profiling`); zero otherwise.
     pub alloc_count: u64,
     pub alloc_bytes: u64,
     pub per_server: HashMap<String, usize>,
@@ -74,7 +75,7 @@ impl Metrics {
     pub fn on_connect(&self, server: &str) {
         self.connections_total.fetch_add(1, Relaxed);
         let now_active = self.active.fetch_add(1, Relaxed) + 1;
-        self.peak_active.fetch_max(now_active, Relaxed); // 최대 동시접속 high-water
+        self.peak_active.fetch_max(now_active, Relaxed); // peak concurrent connections high-water mark
         self.inc_server(server);
     }
 
@@ -95,7 +96,7 @@ impl Metrics {
         self.msgs_down.fetch_add(1, Relaxed);
     }
 
-    /// down 포워드 1건의 처리시간(recv→client send 완료) 기록 — 평균 forward latency 용.
+    /// Records the processing time for one downstream forward (recv → client send complete) — used for average forward latency.
     #[inline]
     pub fn on_forward(&self, elapsed: std::time::Duration) {
         self.fwd_ns_total.fetch_add(elapsed.as_nanos() as u64, Relaxed);
@@ -116,12 +117,12 @@ impl Metrics {
         self.active.load(Relaxed)
     }
 
-    /// 서버별 현재 인원 스냅샷 (plist 용).
+    /// Snapshot of current player counts per server (for plist).
     pub fn per_server_snapshot(&self) -> HashMap<String, usize> {
         self.per_server.read().map(|m| m.clone()).unwrap_or_default()
     }
 
-    /// 전체 메트릭 스냅샷 (웹 /metrics, 콘솔 info 용).
+    /// Full metrics snapshot (for web /metrics and console info).
     pub fn snapshot(&self) -> MetricsSnapshot {
         let bytes_up = self.bytes_up.load(Relaxed);
         let bytes_down = self.bytes_down.load(Relaxed);
@@ -139,7 +140,7 @@ impl Metrics {
         } else {
             0
         };
-        // 할당 카운터는 profiling 빌드에서만 의미값. 평시엔 0(카운팅 할당자 미사용).
+        // Allocation counters are meaningful only in profiling builds; zero at runtime (counting allocator not installed).
         #[cfg(feature = "profiling")]
         let (alloc_count, alloc_bytes) = (
             crate::profiling::ALLOC_COUNT.load(Relaxed),
@@ -184,7 +185,7 @@ impl Metrics {
         }
     }
 
-    /// 주기 메트릭 로깅 태스크. interval_secs=0 이면 시작 안 함.
+    /// Spawns the periodic metrics logging task. Does nothing if `interval_secs` is 0.
     pub fn spawn_logger(self: &Arc<Self>, interval_secs: u64) {
         if interval_secs == 0 {
             return;
@@ -192,7 +193,7 @@ impl Metrics {
         let m = self.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(interval_secs));
-            tick.tick().await; // 즉시 발화 소비
+            tick.tick().await; // consume the immediate first tick
             let (mut last_up, mut last_down) = (0u64, 0u64);
             let (mut last_mu, mut last_md) = (0u64, 0u64);
             loop {
@@ -222,8 +223,8 @@ impl Metrics {
         });
     }
 
-    /// 성능 데이터 수집: interval 초마다 메트릭 스냅샷을 JSONL 한 줄씩 파일에 append.
-    /// 각 줄에 ts_ms(epoch) 포함 → 나중에 이 파일을 받아 시계열 분석(상황별 핫패스 판단)에 쓴다.
+    /// Spawns the performance data collection task: appends one JSONL line per metrics snapshot every `interval` seconds.
+    /// Each line includes `ts_ms` (epoch ms) — retrieve the file later for time-series analysis to identify hot paths.
     pub fn spawn_history(self: &Arc<Self>, path: String, interval_secs: u64) {
         let interval = if interval_secs == 0 { 10 } else { interval_secs };
         let m = self.clone();

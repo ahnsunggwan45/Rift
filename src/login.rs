@@ -1,8 +1,9 @@
-//! Login 패킷에서 displayName/XUID 추출 (best-effort, 콘솔/모니터링 표시 전용).
+//! Extracts the displayName and XUID from a Login packet (best-effort, for console/monitoring display only).
 //!
-//! 프록시는 로그인 토큰을 검증·복호화하지 않고 그대로 포워딩한다(평문 A모드). 여기서는
-//! **표시 목적으로만** chain JWT 페이로드를 base64 디코드해 읽는다 — 서명 검증 없음, 어떤
-//! 단계든 실패하면 조용히 None. 신뢰 경계가 아니므로 표시값이 위조돼도 보안 영향 없음.
+//! The proxy forwards login tokens as-is without verifying or decrypting them (plaintext passthrough mode).
+//! Here, the chain JWT payload is base64-decoded **for display purposes only** — no signature verification.
+//! Any failure at any step silently returns None. This is not a trust boundary; spoofed display values
+//! have no security impact.
 
 use base64::Engine;
 
@@ -12,23 +13,23 @@ pub struct Identity {
     pub xuid: Option<String>,
 }
 
-/// Login 게임패킷 바이트(VarInt 패킷헤더로 시작)에서 이름/XUID 를 뽑는다. 실패는 전부 None.
+/// Extracts the display name and XUID from a Login game packet (starts with a VarInt packet header). All failures return None.
 pub fn extract(login_pkt: &[u8]) -> Identity {
     let id = parse(login_pkt).unwrap_or_default();
     if id.name.is_none() {
-        // 이름 추출 실패 — Bedrock 버전마다 Login/chain 포맷이 다를 수 있다. 포맷 파악용으로
-        // 로그인 앞부분(헤더·길이 등 바이너리는 '.')을 1회 로깅한다(세션당 1회만 호출됨).
+        // Display name extraction failed — the Login/chain format may vary across Bedrock versions.
+        // Log the first 96 bytes (binary bytes rendered as '.') once per session to aid format diagnosis.
         let head: String = String::from_utf8_lossy(&login_pkt[..login_pkt.len().min(96)])
             .chars()
             .map(|c| if c.is_control() { '.' } else { c })
             .collect();
-        tracing::warn!(len = login_pkt.len(), head = %head, "login: displayName 추출 실패 — 앞 96B(포맷 진단)");
+        tracing::warn!(len = login_pkt.len(), head = %head, "login: failed to extract displayName — first 96B for format diagnosis");
     }
     id
 }
 
 fn parse(pkt: &[u8]) -> Option<Identity> {
-    // 패킷 헤더(VarInt). Login 은 sub-client id 0 이라 헤더 == id == 1.
+    // Packet header (VarInt). Login has sub-client id 0, so header == id == 1.
     let (_hdr, adv) = read_varuint(pkt, 0)?;
     let mut p = adv;
     // protocol: int32 BE (4 bytes).
@@ -36,7 +37,7 @@ fn parse(pkt: &[u8]) -> Option<Identity> {
     if p > pkt.len() {
         return None;
     }
-    // connection request: ByteArray (VarUint 길이 + 내용).
+    // Connection request: ByteArray (VarUint length prefix + content).
     let (cr_len, adv) = read_varuint(pkt, p)?;
     p += adv;
     let cr_end = p.checked_add(cr_len as usize)?;
@@ -45,7 +46,7 @@ fn parse(pkt: &[u8]) -> Option<Identity> {
     }
     let cr = &pkt[p..cr_end];
 
-    // connection request 내부: LE u32 chainLen + chain JSON + (이후 clientData, 미사용).
+    // Inside the connection request: LE u32 chainLen + chain JSON + (clientData follows, unused here).
     if cr.len() < 4 {
         return None;
     }
@@ -62,7 +63,7 @@ fn parse(pkt: &[u8]) -> Option<Identity> {
     for jwt in &jwts {
         if let Some(id) = identity_from_jwt(jwt) {
             if id.name.is_some() {
-                return Some(id); // 이름 찾으면 즉시 반환
+                return Some(id); // found a name — return immediately
             }
             if xuid_only.is_none() {
                 xuid_only = id.xuid;
@@ -70,16 +71,16 @@ fn parse(pkt: &[u8]) -> Option<Identity> {
         }
     }
 
-    // 폴백: clientData JWT 의 ThirdPartyName (오프라인/신 포맷에서 표시 이름이 여기 있음).
+    // Fallback: ThirdPartyName from the clientData JWT (display name lives here in offline/newer formats).
     if let Some(name) = client_data_name(cr, chain_end) {
         return Some(Identity { name: Some(name), xuid: xuid_only });
     }
-    // 이름 못 찾음 — xuid 만이라도 있으면 반환(진단 로깅은 호출부 extract 에서 일괄 처리).
+    // No name found — return xuid alone if available (diagnostic logging is handled by the caller).
     xuid_only.map(|xuid| Identity { name: None, xuid: Some(xuid) })
 }
 
-/// connectionRequest 의 두 번째 블록(clientData JWT)에서 ThirdPartyName(표시 이름) 추출.
-/// 레이아웃: [LE u32 chainLen][chain][LE u32 clientDataLen][clientData JWT].
+/// Extracts ThirdPartyName (display name) from the second block (clientData JWT) of the connectionRequest.
+/// Layout: [LE u32 chainLen][chain][LE u32 clientDataLen][clientData JWT].
 fn client_data_name(cr: &[u8], chain_end: usize) -> Option<String> {
     if chain_end + 4 > cr.len() {
         return None;
@@ -102,7 +103,7 @@ fn client_data_name(cr: &[u8], chain_end: usize) -> Option<String> {
         .map(str::to_string)
 }
 
-/// JWT(header.payload.sig)의 payload(base64url)를 디코드해 JSON 으로.
+/// Decodes the payload (base64url middle segment) of a JWT (header.payload.sig) into a JSON value.
 fn jwt_payload(token: &str) -> Option<serde_json::Value> {
     let b64 = token.split('.').nth(1)?.trim_end_matches('=');
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -111,10 +112,10 @@ fn jwt_payload(token: &str) -> Option<serde_json::Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// chain JWT 문자열들을 모은다. 알려진 포맷 모두 대응:
-///  - `{"chain":[...]}`              (구 포맷)
-///  - `{"Certificate":"{...chain...}"}` (신 포맷, 문자열 안에 중첩)
-///  - 순수 배열 `[...]`
+/// Collects chain JWT strings, handling all known formats:
+///  - `{"chain":[...]}`                    (legacy format)
+///  - `{"Certificate":"{...chain...}"}` (newer format, chain nested inside a string)
+///  - Plain array `[...]`
 fn collect_chain_jwts(v: &serde_json::Value) -> Vec<String> {
     fn as_str_vec(val: &serde_json::Value) -> Option<Vec<String>> {
         Some(
@@ -134,7 +135,7 @@ fn collect_chain_jwts(v: &serde_json::Value) -> Vec<String> {
             }
         }
     }
-    // 신 포맷(1.26.30): {"AuthenticationType":N, "Token":"<jwt>"} — 단일 토큰 JWT.
+    // Newer format (1.26.30): {"AuthenticationType":N, "Token":"<jwt>"} — single-token JWT.
     if let Some(tok) = v.get("Token").and_then(|t| t.as_str()) {
         if !tok.is_empty() {
             return vec![tok.to_string()];
@@ -149,7 +150,7 @@ fn identity_from_jwt(token: &str) -> Option<Identity> {
         .decode(payload_b64)
         .ok()?;
     let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    // displayName/XUID 는 보통 extraData 안에 있으나, 버전에 따라 페이로드 최상위에 있기도 하다.
+    // displayName/XUID are typically inside extraData, but may appear at the payload top level in some versions.
     let src = v.get("extraData").unwrap_or(&v);
     let name = src
         .get("displayName")
@@ -162,7 +163,7 @@ fn identity_from_jwt(token: &str) -> Option<Identity> {
     Some(Identity { name, xuid })
 }
 
-/// VarUint(LEB128) 디코드. (값, 소비 바이트) 반환. 5바이트 초과/버퍼 부족이면 None.
+/// Decodes a VarUint (LEB128). Returns `(value, bytes_consumed)`, or None if the input exceeds 5 bytes or is truncated.
 fn read_varuint(buf: &[u8], start: usize) -> Option<(u32, usize)> {
     let mut p = start;
     let mut result = 0u32;
@@ -195,7 +196,7 @@ mod tests {
 
     #[test]
     fn extracts_from_synthetic_login() {
-        // 합성 Login: 헤더(1) + protocol(4 BE) + connReq(VarUint len + [LE u32 chainLen + chainJSON]).
+        // Synthetic Login: header(1) + protocol(4 BE) + connReq(VarUint len + [LE u32 chainLen + chainJSON]).
         let payload = serde_json::json!({"extraData": {"displayName": "Steve", "XUID": "2535"}});
         let payload_b64 =
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string());
@@ -208,9 +209,9 @@ mod tests {
         cr.extend_from_slice(chain_bytes);
 
         let mut pkt = Vec::new();
-        pkt.push(0x01); // 헤더
+        pkt.push(0x01); // header
         pkt.extend_from_slice(&[0, 0, 0, 100]); // protocol int32 BE
-        // connection request 길이(VarUint) + 내용
+        // connection request length (VarUint) + content
         let mut len = cr.len() as u32;
         loop {
             let mut b = (len & 0x7f) as u8;
@@ -230,13 +231,13 @@ mod tests {
         assert_eq!(id.xuid.as_deref(), Some("2535"));
     }
 
-    // 헤더(1) + protocol(4 BE) + connReq(VarUint len + [LE u32 chainLen + chainJSON]) 로 합성 Login 생성.
+    // Builds a synthetic Login packet: header(1) + protocol(4 BE) + connReq(VarUint len + [LE u32 chainLen + chainJSON]).
     fn synth_login(chain_json: &str) -> Vec<u8> {
         let cb = chain_json.as_bytes();
         let mut cr = Vec::new();
         cr.extend_from_slice(&(cb.len() as u32).to_le_bytes());
         cr.extend_from_slice(cb);
-        let mut pkt = vec![0x01u8, 0, 0, 0, 100]; // 헤더 + protocol
+        let mut pkt = vec![0x01u8, 0, 0, 0, 100]; // header + protocol
         let mut len = cr.len() as u32;
         loop {
             let mut b = (len & 0x7f) as u8;
@@ -261,7 +262,7 @@ mod tests {
 
     #[test]
     fn extracts_from_nested_certificate_format() {
-        // 신 포맷: 최상위 {"Certificate": "<json string with chain>"}.
+        // Newer format: top-level {"Certificate": "<json string with chain>"}.
         let jwt = jwt_with(serde_json::json!({"displayName": "Alex", "XUID": "9001"}));
         let inner = serde_json::json!({ "chain": [jwt] }).to_string();
         let chain = serde_json::json!({"AuthenticationType": 2, "Certificate": inner}).to_string();
@@ -272,7 +273,7 @@ mod tests {
 
     #[test]
     fn extracts_displayname_from_token_format() {
-        // 1.26.30 신 포맷: {"AuthenticationType":N, "Token":"<jwt>"}, Token 의 extraData 에 이름.
+        // 1.26.30 newer format: {"AuthenticationType":N, "Token":"<jwt>"}, name is in Token's extraData.
         let token = jwt_with(serde_json::json!({"displayName": "Jeb", "XUID": "7"}));
         let chain = serde_json::json!({"AuthenticationType": 0, "Token": token}).to_string();
         let id = extract(&synth_login(&chain));
@@ -282,8 +283,8 @@ mod tests {
 
     #[test]
     fn falls_back_to_clientdata_thirdpartyname() {
-        // Token 에 displayName 이 없으면(오프라인 등) clientData 의 ThirdPartyName 으로 폴백.
-        let token = jwt_with(serde_json::json!({"XUID": "5"})); // displayName 없음
+        // If Token has no displayName (e.g. offline mode), fall back to ThirdPartyName from clientData.
+        let token = jwt_with(serde_json::json!({"XUID": "5"})); // no displayName
         let chain = serde_json::json!({"AuthenticationType": 0, "Token": token}).to_string();
         let client_payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::json!({"ThirdPartyName": "Notch"}).to_string());
@@ -296,7 +297,7 @@ mod tests {
         cr.extend_from_slice(&(client_jwt.len() as u32).to_le_bytes());
         cr.extend_from_slice(client_jwt.as_bytes());
 
-        let mut pkt = vec![0x01u8, 0, 0, 0, 100]; // 헤더 + protocol
+        let mut pkt = vec![0x01u8, 0, 0, 0, 100]; // header + protocol
         let mut len = cr.len() as u32;
         loop {
             let mut b = (len & 0x7f) as u8;

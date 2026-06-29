@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::{arq::*, packet::*, raknet_log_debug, utils::*};
-// Rift Phase 1: 수신 메시지를 Bytes 로 전달(딥카피 제거, zero-copy 패스스루 토대).
+// Rift Phase 1: deliver received messages as Bytes (eliminates deep-copy, lays the groundwork for zero-copy passthrough).
 use bytes::Bytes;
 
 /// Raknet socket wrapper with local and remote.
@@ -145,7 +145,7 @@ impl RaknetSocket {
                 return Ok(false);
             }
             _ => {
-                // Rift Phase 1: frame.data(Bytes) 를 그대로 이동 전달 (zero-copy, 딥카피 없음).
+                // Rift Phase 1: forward frame.data (Bytes) directly — zero-copy, no deep-copy.
                 match user_data_sender.send(frame.data).await {
                     Ok(_) => {}
                     Err(_) => {
@@ -440,7 +440,7 @@ impl RaknetSocket {
                 if connected.is_closed() {
                     let mut recvq = recvq.lock().await;
                     for f in recvq.flush(&peer_addr) {
-                        // 종료 flush — handle 에러는 무시(어차피 닫는 중).
+                        // shutdown flush — ignore handle errors (connection is closing anyway).
                         let _ = RaknetSocket::handle(
                             f,
                             &peer_addr,
@@ -509,7 +509,7 @@ impl RaknetSocket {
                 if buf[0] >= PacketID::FrameSetPacketBegin.to_u8()
                     && buf[0] <= PacketID::FrameSetPacketEnd.to_u8()
                 {
-                    // Rift 안정화: 손상/잘린 데이터그램에 panic 대신 드롭하고 계속.
+                    // Rift hardening: drop malformed/truncated datagrams instead of panicking.
                     let frames = match FrameVec::new(buf.clone()) {
                         Ok(f) => f,
                         Err(_) => {
@@ -549,10 +549,11 @@ impl RaknetSocket {
                         }
                     }
 
-                    // Rift patch: ACK 를 여기서 per-datagram 으로 보내지 않는다.
-                    // 받은 sequence 는 recvq(ackset)에 누적되고, start_tick() 의 50ms
-                    // 주기에서 하나의 ACK 로 배칭 전송된다. (per-datagram ACK 은 프록시 뒤
-                    // 다운스트림으로 ACK 폭주를 일으켜 RakLib ipSec(200/10ms) 차단을 유발함.)
+                    // Rift patch: ACKs are NOT sent per-datagram here.
+                    // Received sequence numbers accumulate in the recvq ackset and are
+                    // batched into a single ACK every 50 ms by start_tick().
+                    // Per-datagram ACKs caused an ACK flood toward the downstream behind
+                    // the proxy, triggering RakLib's ipSec rate-limiter (200 packets / 10 ms).
                 } else {
                     raknet_log_debug!("unknown packetid : {}", buf[0]);
                 }
@@ -638,8 +639,8 @@ impl RaknetSocket {
                     .unwrap();
                 }
 
-                // Rift patch: flush ack (배칭). 50ms 창에 받은 모든 sequence 를
-                // 하나의 ACK 로 모아 보낸다 — 원본의 per-datagram ACK 폭주를 제거.
+                // Rift patch: flush ack (batched). All sequences received within the 50 ms
+                // window are coalesced into a single ACK — eliminates the per-datagram ACK flood.
                 let acks = recvq.get_ack();
                 if !acks.is_empty() {
                     let ack = Ack {
@@ -729,7 +730,7 @@ impl RaknetSocket {
         });
     }
 
-    /// 현재 추정 왕복시간(SRTT, ms). 핑 표시용 — 송신/ACK 왕복으로 갱신된다.
+    /// Current estimated round-trip time (SRTT, ms). Use for ping display — updated on each send/ACK cycle.
     pub async fn rtt(&self) -> i64 {
         self.sendq.read().await.get_srtt()
     }
@@ -852,8 +853,9 @@ impl RaknetSocket {
         Ok(())
     }
 
-    /// `Bytes` 진입점 (Rift Phase 1 send-side zero-copy). recv() 로 받은 Bytes 를
-    /// 복사 없이 송신 큐에 넣는다(프록시 포워딩 핫패스: recv Bytes → send_bytes → 프레임 slice).
+    /// `Bytes` entry point (Rift Phase 1 send-side zero-copy). Enqueues `Bytes` received from
+    /// `recv()` into the send queue without copying (proxy forwarding hot-path:
+    /// recv Bytes → send_bytes → frame slice).
     pub async fn send_bytes(&self, data: Bytes, r: Reliability) -> Result<()> {
         if data.is_empty() {
             return Err(RaknetError::PacketHeaderError);

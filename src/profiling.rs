@@ -1,7 +1,9 @@
-//! 측정 전용 계측 (`--features profiling`). 이 feature 없이는 컴파일조차 안 되므로 프로덕션 오버헤드 0.
+//! Measurement-only instrumentation (`--features profiling`). Without this feature the code does not
+//! compile in, so production overhead is zero.
 //!
-//! 시스템 할당자를 감싸 alloc 횟수/바이트를 센다 → `/metrics` 의 `alloc_count`/`alloc_bytes` 로
-//! "Hot Path Allocation = 0"(관심 없는 패킷에서 할당 0) 목표를 실측 검증한다.
+//! Wraps the system allocator to count allocation calls and bytes → exposed via `/metrics` as
+//! `alloc_count`/`alloc_bytes` to verify the "Hot Path Allocation = 0" goal
+//! (zero allocations for uninteresting packets).
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -11,7 +13,7 @@ pub static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 
 pub struct CountingAllocator;
 
-// SAFETY: 모든 호출을 System 에 위임하고, 카운터만 relaxed 가산한다.
+// SAFETY: All calls are delegated to System; only the counters are incremented with relaxed ordering.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOC_COUNT.fetch_add(1, Relaxed);

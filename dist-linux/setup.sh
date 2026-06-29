@@ -1,33 +1,33 @@
 #!/usr/bin/env bash
-# Rift VPS 원클릭 설치.
-#   사용법: 이 파일 + 바이너리(rift-musl 권장) + config.toml 을 한 폴더에 올리고
-#           그 폴더에서  sudo bash setup.sh
-# 하는 일: /opt/rift 에 설치 → systemd 서비스 등록 → 방화벽(ufw) 개방 → 자동 시작.
+# Rift VPS one-click installer.
+#   Usage: place this file, a binary (rift-musl recommended), and config.toml in the same directory,
+#          then from that directory run:  sudo bash setup.sh
+# What it does: installs to /opt/rift → registers a systemd service → opens firewall ports (ufw) → starts the service.
 set -euo pipefail
 
 INSTALL_DIR=/opt/rift
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-echo "== Rift 설치 시작 =="
+echo "== Rift installer starting =="
 
 if [ "$(id -u)" -ne 0 ]; then
-  echo "!! root 로 실행하세요:  sudo bash setup.sh"; exit 1
+  echo "!! Must be run as root:  sudo bash setup.sh"; exit 1
 fi
 
-# 1) 바이너리 선택 (musl 정적 우선 → glibc 순)
+# 1) Select binary (musl static preferred → glibc fallback)
 BIN=""
 for cand in rift-musl rift.stripped rift; do
   if [ -f "$SRC_DIR/$cand" ]; then BIN="$cand"; break; fi
 done
 if [ -z "$BIN" ]; then
-  echo "!! 바이너리를 못 찾음. rift-musl (또는 .stripped) 를 이 폴더에 함께 올리세요."; exit 1
+  echo "!! No binary found. Place rift-musl (or rift.stripped) in this directory."; exit 1
 fi
 if [ ! -f "$SRC_DIR/config.toml" ]; then
-  echo "!! config.toml 이 이 폴더에 없습니다. 함께 올리세요."; exit 1
+  echo "!! config.toml not found in this directory. Place it here before running."; exit 1
 fi
-echo "-> 바이너리: $BIN"
+echo "-> Binary: $BIN"
 
-# 2) 설치 디렉터리로 복사 (이미 같은 위치면 건너뜀)
+# 2) Copy to install directory (skip if already in place)
 mkdir -p "$INSTALL_DIR"
 if ! [ "$SRC_DIR/$BIN" -ef "$INSTALL_DIR/rift" ]; then
   cp -f "$SRC_DIR/$BIN" "$INSTALL_DIR/rift"
@@ -37,15 +37,15 @@ if ! [ "$SRC_DIR/config.toml" -ef "$INSTALL_DIR/config.toml" ]; then
 fi
 if [ -d "$SRC_DIR/packs" ] && ! [ "$SRC_DIR/packs" -ef "$INSTALL_DIR/packs" ]; then
   cp -rf "$SRC_DIR/packs" "$INSTALL_DIR/"
-  echo "-> packs/ 복사됨 (리소스팩 서빙)"
+  echo "-> packs/ copied (resource pack serving)"
 fi
 chmod +x "$INSTALL_DIR/rift"
-echo "-> $INSTALL_DIR 에 설치 완료"
+echo "-> Installed to $INSTALL_DIR"
 
-# 3) systemd 유닛 생성
+# 3) Write systemd unit
 cat > /etc/systemd/system/rift.service <<EOF
 [Unit]
-Description=Rift (Bedrock 프록시)
+Description=Rift (Bedrock proxy)
 After=network-online.target
 Wants=network-online.target
 
@@ -63,9 +63,9 @@ LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 EOF
-echo "-> systemd 유닛 등록 (/etc/systemd/system/rift.service)"
+echo "-> systemd unit registered (/etc/systemd/system/rift.service)"
 
-# 4) 방화벽 (ufw 있을 때만) — 포트는 config.toml 에서 자동 추출
+# 4) Firewall (ufw only, if present) — ports are extracted from config.toml automatically
 CFG="$INSTALL_DIR/config.toml"
 LISTEN_PORT=$(grep -E '^[[:space:]]*host[[:space:]]*=' "$CFG" 2>/dev/null | grep -oE '[0-9]+' | tail -1 || true)
 LISTEN_PORT=${LISTEN_PORT:-19132}
@@ -73,27 +73,27 @@ WEB_PORT=$(grep -E '^[[:space:]]*web_addr[[:space:]]*=' "$CFG" 2>/dev/null | gre
 if command -v ufw >/dev/null 2>&1; then
   ufw allow ${LISTEN_PORT}/udp >/dev/null 2>&1 || true
   [ -n "$WEB_PORT" ] && { ufw allow ${WEB_PORT}/tcp >/dev/null 2>&1 || true; }
-  echo "-> ufw 개방: ${LISTEN_PORT}/udp (접속)${WEB_PORT:+, ${WEB_PORT}/tcp (모니터링)}"
+  echo "-> ufw opened: ${LISTEN_PORT}/udp (game)${WEB_PORT:+, ${WEB_PORT}/tcp (monitoring)}"
 else
-  echo "-> ufw 없음 → 방화벽 수동 확인: UDP ${LISTEN_PORT}${WEB_PORT:+, TCP ${WEB_PORT}}"
+  echo "-> ufw not found — manually open: UDP ${LISTEN_PORT}${WEB_PORT:+, TCP ${WEB_PORT}}"
 fi
 
-# 5) 시작
+# 5) Start
 systemctl daemon-reload
 systemctl enable rift >/dev/null 2>&1 || true
 systemctl restart rift
 sleep 1
 
 echo
-echo "== 설치 완료 =="
+echo "== Installation complete =="
 systemctl --no-pager status rift | head -n 6 || true
 echo
-echo "확인:"
-echo "  로그        :  journalctl -u rift -f"
-echo "  모니터링     :  http://<이 VPS의 IP>:${WEB_PORT:-8080}"
-echo "  게임 접속    :  <이 VPS의 IP>:${LISTEN_PORT}"
+echo "Quick reference:"
+echo "  Logs         :  journalctl -u rift -f"
+echo "  Monitoring   :  http://<this VPS IP>:${WEB_PORT:-8080}"
+echo "  Game connect :  <this VPS IP>:${LISTEN_PORT}"
 echo
-echo "!! 반드시 확인:"
-echo "  1) 클라우드 방화벽/보안그룹에서도 UDP ${LISTEN_PORT} 인바운드 개방 (ufw만으론 부족할 수 있음)"
-echo "  2) 모든 다운스트림 PMMP 서버: Optimizer 플러그인 배포 + enable-encryption: false"
-echo "     (안 하면 채널이동 시 워프/자기 캐릭터가 깨짐)"
+echo "!! Important checklist:"
+echo "  1) Open UDP ${LISTEN_PORT} inbound in your cloud firewall / security group as well (ufw alone may not be enough)"
+echo "  2) All downstream PMMP servers: deploy the Optimizer plugin + set enable-encryption: false"
+echo "     (without this, entity state will break on channel transfer)"

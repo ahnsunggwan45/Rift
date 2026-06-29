@@ -140,7 +140,7 @@ impl FrameSetPacket {
         let n = ret.length_in_bytes as usize;
         let mut buf = vec![0u8; n];
         reader.read(&mut buf)?;
-        ret.data = Bytes::from(buf); // O(1) 이동 (기존 read→buf + to_vec 이중복사 제거)
+        ret.data = Bytes::from(buf); // O(1) move — eliminates the prior read→buf + to_vec double-copy
 
         Ok((ret, reader.pos() == n as u64))
     }
@@ -328,7 +328,7 @@ impl FrameVec {
 
             let mut buf = vec![0u8; frame.length_in_bytes as usize];
             reader.read(&mut buf)?;
-            frame.data = Bytes::from(buf); // O(1) 이동 (read→buf + to_vec 이중복사 제거)
+            frame.data = Bytes::from(buf); // O(1) move — eliminates the read→buf + to_vec double-copy
             ret.frames.push(frame);
         }
 
@@ -437,8 +437,9 @@ impl ACKSet {
     }
 }
 
-// Rift: 신뢰 메시지 재전송 중복 제거용 윈도 크기. 재전송 dup 은 보통 1 RTO 안에 도착하므로
-// 이 정도면 충분히 잡고, 메모리는 연결당 ~수십 KB 로 bound 된다.
+// Rift: dedup window size for reliable message retransmits. Retransmit duplicates
+// typically arrive within one RTO, so this window is more than sufficient; memory
+// is bounded to ~tens of KB per connection.
 const RELIABLE_DEDUP_WINDOW: usize = 4096;
 
 pub struct RecvQ {
@@ -448,8 +449,9 @@ pub struct RecvQ {
     packets: HashMap<u32, FrameSetPacket>,
     ordered_packets: HashMap<u32, FrameSetPacket>,
     fragment_queue: FragmentQ,
-    /// 이미 받은 신뢰 메시지의 reliable_frame_index 집합 + FIFO 윈도(메모리 bound).
-    /// 원본 rust-raknet 은 sequence_number 로만 중복검사 → 재전송은 번호가 달라 중복 전달되는 버그.
+    /// Set of received reliable_frame_index values + FIFO window (memory-bounded).
+    /// Original rust-raknet deduped only on sequence_number — retransmits get a new
+    /// sequence_number and were therefore delivered twice (bug).
     received_reliable: std::collections::HashSet<u32>,
     reliable_window: std::collections::VecDeque<u32>,
 }
@@ -475,15 +477,16 @@ impl RecvQ {
 
         self.sequence_number_ackset.insert(frame.sequence_number);
 
-        // Rift: 신뢰 메시지 재전송 중복 제거. 재전송은 새 sequence_number 로 오므로 위의
-        // sequence_number 검사(line: packets.contains_key)로는 못 막는다 → reliable_frame_index 로 검사.
-        // ACK 는 바로 위에서 이미 기록했으므로, 중복은 ACK 되되(=상대가 재전송 멈춤) 다시 전달되진 않는다.
+        // Rift: dedup reliable retransmits. Retransmits arrive with a new sequence_number,
+        // so the packets.contains_key check above cannot catch them — use reliable_frame_index instead.
+        // The ACK was already recorded above, so duplicates are still acknowledged
+        // (causing the peer to stop retransmitting) but are not delivered again.
         if matches!(
             frame.reliability()?,
             Reliability::Reliable | Reliability::ReliableOrdered | Reliability::ReliableSequenced
         ) {
             if !self.received_reliable.insert(frame.reliable_frame_index) {
-                return Ok(()); // 이미 받은 신뢰 메시지 → 중복, 드롭
+                return Ok(()); // already received this reliable message — duplicate, drop
             }
             self.reliable_window.push_back(frame.reliable_frame_index);
             if self.reliable_window.len() > RELIABLE_DEDUP_WINDOW {
@@ -644,13 +647,13 @@ impl SendQ {
         }
     }
 
-    /// `&[u8]` 진입점 — Bytes 로 1회 복사 후 insert_bytes 에 위임(기존 호출부 호환).
+    /// `&[u8]` entry point — copies into `Bytes` once and delegates to `insert_bytes` (backward-compatible).
     pub fn insert(&mut self, reliability: Reliability, buf: &[u8]) -> Result<()> {
         self.insert_bytes(reliability, Bytes::copy_from_slice(buf))
     }
 
-    /// Bytes 진입점 (Rift Phase 1 send-side zero-copy). 단일 프레임은 O(1) clone,
-    /// 조각화는 `data.slice(..)`(O(1) 공유)로 구성 — 기존 `buf.to_vec()` 복사 제거.
+    /// `Bytes` entry point (Rift Phase 1 send-side zero-copy). Single frames use O(1) clone;
+    /// fragmented sends use `data.slice(..)` (O(1) shared reference) — eliminates the old `buf.to_vec()` copy.
     pub fn insert_bytes(&mut self, reliability: Reliability, data: Bytes) -> Result<()> {
         match reliability {
             Reliability::Unreliable => {
@@ -708,7 +711,7 @@ impl SendQ {
                             max * (i + 1)
                         };
 
-                        // O(1) Bytes slice (공유) — to_vec 복사 제거.
+                        // O(1) Bytes slice (shared reference) — eliminates to_vec copy.
                         let mut frame =
                             FrameSetPacket::new(reliability.clone(), data.slice(begin..end));
                         // set fragment flag
@@ -767,7 +770,7 @@ impl SendQ {
         self.rto
     }
 
-    /// 평활화 왕복시간(SRTT, ms). RTO(50ms 하한)보다 실제 핑에 가깝다.
+    /// Smoothed round-trip time (SRTT, ms). Closer to the actual ping than the RTO (50 ms floor).
     pub fn get_srtt(&self) -> i64 {
         self.srtt
     }
@@ -957,7 +960,7 @@ async fn test_recvq() {
     let mut p = FrameSetPacket::new(Reliability::Reliable, vec![]);
     p.sequence_number = 0;
     p.ordered_frame_index = 0;
-    p.reliable_frame_index = 0; // 실제 신뢰 메시지는 고유 index 를 가진다
+    p.reliable_frame_index = 0; // each real reliable message has a unique index
     r.insert(p).unwrap();
 
     let mut p = FrameSetPacket::new(Reliability::Reliable, vec![]);
@@ -980,7 +983,7 @@ async fn test_recvq_fragment() {
     p.compound_id = 1;
     p.compound_size = 3;
     p.fragment_index = 1;
-    p.reliable_frame_index = 0; // 한 compound 의 조각들은 각자 고유 reliable index 를 가진다
+    p.reliable_frame_index = 0; // each fragment within a compound has its own unique reliable index
     r.insert(p).unwrap();
 
     let mut p = FrameSetPacket::new(Reliability::ReliableOrdered, vec![2]);
@@ -1342,7 +1345,8 @@ async fn test_client_packet2() {
         }
     }
 
-    // p1(=p0 재전송, rfi=0), p5(=p2 재전송, rfi=1), p6(=p4 재전송, rfi=2) 는 모두 중복.
-    // 중복 제거 수정 후 고유 메시지 4개(p0,p2,p3,p4)만 전달된다(이전엔 p1 도 잘못 전달돼 5).
+    // p1(=retransmit of p0, rfi=0), p5(=retransmit of p2, rfi=1), p6(=retransmit of p4, rfi=2) are all duplicates.
+    // After the dedup fix, only 4 unique messages (p0, p2, p3, p4) are delivered (previously p1 was also
+    // wrongly delivered, giving 5).
     assert!(n == 4);
 }

@@ -2,12 +2,12 @@
 /target
 **/*.rs.bk
 
-# 사용자별 설정·자산 (예시는 config.example.toml)
+# Per-user config and assets (see config.example.toml for the template)
 config.toml
 config.local-test.toml
 packs/
 
-# 빌드된 배포 바이너리 (dist-linux 에는 스크립트만 커밋)
+# Built deploy binaries (only scripts are committed under dist-linux)
 dist-linux/rift
 dist-linux/rift-musl
 dist-linux/rift.stripped
@@ -15,7 +15,7 @@ dist-linux/rift-prof
 *.log
 *.jsonl
 
-# riftbench 빌드 산출물
+# riftbench build artifacts
 tools/riftbench/riftbench
 tools/riftbench/riftbench.exe
 tools/riftbench/riftbench-linux

@@ -1,8 +1,10 @@
-//! 세션 레지스트리 — 콘솔/웹이 활성 세션을 조회하고 조작(전환·강제종료)하는 단일 출처.
+//! Session registry — the single source of truth for the console/web to query and manipulate
+//! active sessions (transfer, kick).
 //!
-//! 각 relay 태스크는 시작 시 `register` 로 자신을 등록하고 종료 시 `remove` 한다. 콘솔/웹은
-//! `snapshot`(읽기)·`find_control`(조작)으로 접근한다. 조작은 세션별 mpsc 제어 채널로 전달돼
-//! relay 의 select 루프가 처리한다(직접 소켓을 건드리지 않음 → 경쟁 없음).
+//! Each relay task registers itself on start via `register` and unregisters on exit via `remove`.
+//! The console and web layer access sessions through `snapshot` (read) and `find_control`
+//! (manipulate). Control commands are delivered over a per-session mpsc channel and processed by
+//! the relay's select loop (no direct socket access — no races).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -12,15 +14,15 @@ use std::time::Instant;
 
 use tokio::sync::mpsc;
 
-/// 콘솔/웹 → 특정 세션 relay 루프로 보내는 제어 명령.
+/// Control commands sent from the console/web to a specific session's relay loop.
 pub enum Control {
-    /// 지정 서버로 채널이동.
+    /// Transfer the session to the specified server.
     Transfer(String),
-    /// 세션 강제 종료.
+    /// Force-disconnect the session.
     Kick,
 }
 
-/// 한 세션의 레지스트리 항목.
+/// Registry entry for a single session.
 struct Entry {
     name: Option<String>,
     #[allow(dead_code)]
@@ -32,16 +34,16 @@ struct Entry {
     rtt_ms: u32,
 }
 
-/// 웹 `/players` · 콘솔 `list` 직렬화용 세션 요약.
+/// Session summary serialized for `GET /players` and the console `list` command.
 #[derive(serde::Serialize)]
 pub struct SessionInfo {
     pub id: u64,
     pub name: Option<String>,
     pub peer: String,
     pub server: String,
-    /// 접속 후 경과 시간(초).
+    /// Seconds elapsed since connection.
     pub connected_secs: u64,
-    /// 클라↔프록시 추정 RTT(ms, SRTT).
+    /// Estimated client↔proxy RTT in ms (SRTT).
     pub rtt_ms: u32,
 }
 
@@ -52,7 +54,7 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// 새 세션 등록. 반환된 id 로 이후 set_identity/set_server/remove.
+    /// Register a new session. Use the returned id for subsequent set_identity/set_server/remove calls.
     pub fn register(&self, peer: SocketAddr, server: String, control: mpsc::Sender<Control>) -> u64 {
         let id = self.next_id.fetch_add(1, Relaxed);
         if let Ok(mut s) = self.sessions.write() {
@@ -61,7 +63,7 @@ impl Registry {
         id
     }
 
-    /// Login 에서 뽑은 이름/XUID 를 세션에 채운다(있는 값만).
+    /// Populate the session with name/XUID extracted from the login packet (only non-None values are applied).
     pub fn set_identity(&self, id: u64, name: Option<String>, xuid: Option<String>) {
         if let Ok(mut s) = self.sessions.write() {
             if let Some(e) = s.get_mut(&id) {
@@ -75,7 +77,7 @@ impl Registry {
         }
     }
 
-    /// 채널이동 후 현재 서버 갱신.
+    /// Update the session's current server after a transfer.
     pub fn set_server(&self, id: u64, server: String) {
         if let Ok(mut s) = self.sessions.write() {
             if let Some(e) = s.get_mut(&id) {
@@ -84,7 +86,7 @@ impl Registry {
         }
     }
 
-    /// 주기적으로 측정한 클라↔프록시 RTT(ms) 갱신.
+    /// Update the periodically measured client↔proxy RTT (ms).
     pub fn set_rtt(&self, id: u64, rtt_ms: u32) {
         if let Ok(mut s) = self.sessions.write() {
             if let Some(e) = s.get_mut(&id) {
@@ -99,7 +101,7 @@ impl Registry {
         }
     }
 
-    /// 활성 세션 요약 (id 오름차순).
+    /// Return a snapshot of all active sessions sorted by id (ascending).
     pub fn snapshot(&self) -> Vec<SessionInfo> {
         let mut v: Vec<SessionInfo> = self
             .sessions
@@ -121,16 +123,16 @@ impl Registry {
         v
     }
 
-    /// 이름(대소문자 무시) 또는 세션 번호로 세션을 찾아 (id, 제어 채널 복제)를 반환.
+    /// Look up a session by name (case-insensitive) or numeric id; returns (id, control channel clone).
     pub fn find_control(&self, who: &str) -> Option<(u64, mpsc::Sender<Control>)> {
         let s = self.sessions.read().ok()?;
-        // 번호 우선.
+        // Numeric id takes precedence.
         if let Ok(id) = who.parse::<u64>() {
             if let Some(e) = s.get(&id) {
                 return Some((id, e.control.clone()));
             }
         }
-        // 이름 매칭.
+        // Name match.
         s.iter()
             .find(|(_, e)| {
                 e.name

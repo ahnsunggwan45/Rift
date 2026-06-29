@@ -193,7 +193,7 @@ impl RaknetReader {
         }
     }
     pub fn read_u8(&mut self) -> Result<u8> {
-        // Rift: bounds check — get_u8() 는 빈 버퍼에서 panic. 잘린 패킷에 panic 대신 Err.
+        // Rift: bounds check — get_u8() panics on empty buffer; return Err instead of panicking on a truncated packet.
         if self.buf.remaining() < 1 {
             return Err(RaknetError::ReadPacketBufferError);
         }
@@ -281,7 +281,7 @@ impl RaknetReader {
         }
 
         self.read(&mut buf)?;
-        // Rift: 잘못된 UTF-8 에 panic 대신 lossy (RakNet 문자열 손상 견딤).
+        // Rift: use lossy UTF-8 decoding instead of panicking on malformed strings (RakNet strings may be corrupted).
         Ok(String::from_utf8_lossy(&buf).into_owned())
     }
 

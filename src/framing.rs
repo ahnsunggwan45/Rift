@@ -1,26 +1,26 @@
-//! Bedrock 게임패킷 배치 프레이밍 — 압축 해제된 평문 배치를 다룬다.
+//! Bedrock game packet batch framing — operates on decompressed plaintext batches.
 //!
-//! 배치 구조(압축 해제 후): `[VarInt len][packet]` 반복.
-//! 각 packet 의 첫 VarInt = 헤더: `packetId(0x3ff) | senderSubId<<10 | recipientSubId<<12`
+//! Batch structure (after decompression): repeated `[VarInt len][packet]`.
+//! The first VarInt of each packet is the header: `packetId(0x3ff) | senderSubId<<10 | recipientSubId<<12`
 //! (ground truth: PMMP bedrock-protocol DataPacket.php).
 //!
-//! 프록시 핫패스는 배치를 패킷들로 쪼개 **ID만 peek** 하고, 우리가 처리할 소수만
-//! 손대고 나머지는 그대로 다시 배치로 묶는다.
+//! The proxy hot path splits a batch into individual packets, **peeks only the ID**, touches
+//! the small subset it needs to handle, and reassembles the rest unchanged.
 
-#![allow(dead_code)] // 핸드셰이크/인터셉션 배선 전까지 일부 미사용
+#![allow(dead_code)] // Some items unused until handshake/interception is wired up
 
 use anyhow::{bail, Result};
 
-/// 패킷 ID 마스크 (하위 10비트).
+/// Packet ID mask (lower 10 bits).
 pub const PID_MASK: u32 = 0x3ff;
 
-/// unsigned VarInt(LEB128) 를 읽는다. (값, 소비한 바이트수) 반환.
+/// Reads an unsigned VarInt (LEB128). Returns `(value, bytes_consumed)`.
 pub fn read_varint_u32(buf: &[u8]) -> Result<(u32, usize)> {
     let mut value: u32 = 0;
     let mut shift: u32 = 0;
     for (i, &byte) in buf.iter().enumerate() {
         if shift >= 35 {
-            bail!("VarInt 가 너무 김");
+            bail!("VarInt overflow (too many bytes)");
         }
         value |= ((byte & 0x7f) as u32) << shift;
         if byte & 0x80 == 0 {
@@ -28,10 +28,10 @@ pub fn read_varint_u32(buf: &[u8]) -> Result<(u32, usize)> {
         }
         shift += 7;
     }
-    bail!("VarInt 가 잘림 (버퍼 끝)");
+    bail!("VarInt truncated (unexpected end of buffer)");
 }
 
-/// unsigned VarInt(LEB128) 를 out 에 기록한다.
+/// Writes an unsigned VarInt (LEB128) into `out`.
 pub fn write_varint_u32(mut value: u32, out: &mut Vec<u8>) {
     loop {
         let mut byte = (value & 0x7f) as u8;
@@ -46,7 +46,7 @@ pub fn write_varint_u32(mut value: u32, out: &mut Vec<u8>) {
     }
 }
 
-/// unsigned VarLong(LEB128) 를 out 에 기록한다 (Bedrock ActorRuntimeId 등).
+/// Writes an unsigned VarLong (LEB128) into `out` (used for Bedrock ActorRuntimeId, etc.).
 pub fn write_varint_u64(mut value: u64, out: &mut Vec<u8>) {
     loop {
         let mut byte = (value & 0x7f) as u8;
@@ -61,13 +61,13 @@ pub fn write_varint_u64(mut value: u64, out: &mut Vec<u8>) {
     }
 }
 
-/// unsigned VarLong(LEB128, 최대 10바이트) 를 읽는다. (값, 소비 바이트수).
+/// Reads an unsigned VarLong (LEB128, up to 10 bytes). Returns `(value, bytes_consumed)`.
 pub fn read_varint_u64(buf: &[u8]) -> Result<(u64, usize)> {
     let mut value: u64 = 0;
     let mut shift: u32 = 0;
     for (i, &byte) in buf.iter().enumerate() {
         if shift >= 70 {
-            bail!("VarLong 가 너무 김");
+            bail!("VarLong overflow (too many bytes)");
         }
         value |= ((byte & 0x7f) as u64) << shift;
         if byte & 0x80 == 0 {
@@ -75,36 +75,36 @@ pub fn read_varint_u64(buf: &[u8]) -> Result<(u64, usize)> {
         }
         shift += 7;
     }
-    bail!("VarLong 가 잘림");
+    bail!("VarLong truncated (unexpected end of buffer)");
 }
 
-/// zigzag 부호 VarLong 을 읽는다 (Bedrock ActorUniqueId 등).
+/// Reads a zigzag-encoded signed VarLong (used for Bedrock ActorUniqueId, etc.).
 pub fn read_zigzag_i64(buf: &[u8]) -> Result<(i64, usize)> {
     let (raw, n) = read_varint_u64(buf)?;
     let value = ((raw >> 1) as i64) ^ -((raw & 1) as i64);
     Ok((value, n))
 }
 
-/// zigzag 부호 VarInt(32bit) 를 읽는다 (Bedrock signed VarInt, 예: playerGamemode).
+/// Reads a zigzag-encoded signed VarInt (32-bit Bedrock signed VarInt, e.g. playerGamemode).
 pub fn read_zigzag_i32(buf: &[u8]) -> Result<(i32, usize)> {
     let (raw, n) = read_varint_u32(buf)?;
     let value = ((raw >> 1) as i32) ^ -((raw & 1) as i32);
     Ok((value, n))
 }
 
-/// zigzag 부호 VarInt(32bit) 를 기록한다.
+/// Writes a zigzag-encoded signed VarInt (32-bit).
 pub fn write_zigzag_i32(value: i32, out: &mut Vec<u8>) {
     let zigzag = ((value << 1) ^ (value >> 31)) as u32;
     write_varint_u32(zigzag, out);
 }
 
-/// zigzag 부호 VarLong(64bit) 를 기록한다 (Bedrock ActorUniqueId 등).
+/// Writes a zigzag-encoded signed VarLong (64-bit, used for Bedrock ActorUniqueId, etc.).
 pub fn write_zigzag_i64(value: i64, out: &mut Vec<u8>) {
     let zigzag = ((value << 1) ^ (value >> 63)) as u64;
     write_varint_u64(zigzag, out);
 }
 
-/// 압축 해제된 배치를 개별 패킷 슬라이스들로 쪼갠다.
+/// Splits a decompressed batch into individual packet slices.
 pub fn split_batch(batch: &[u8]) -> Result<Vec<&[u8]>> {
     let mut packets = Vec::new();
     let mut pos = 0;
@@ -113,7 +113,7 @@ pub fn split_batch(batch: &[u8]) -> Result<Vec<&[u8]>> {
         pos += consumed;
         let len = len as usize;
         if pos + len > batch.len() {
-            bail!("배치 패킷 길이({len})가 버퍼를 초과");
+            bail!("batch packet length ({len}) exceeds buffer bounds");
         }
         packets.push(&batch[pos..pos + len]);
         pos += len;
@@ -121,13 +121,13 @@ pub fn split_batch(batch: &[u8]) -> Result<Vec<&[u8]>> {
     Ok(packets)
 }
 
-/// 패킷의 ID(하위 10비트)를 peek 한다. 패킷을 소비하지 않는다.
+/// Peeks the packet ID (lower 10 bits) without consuming the packet.
 pub fn peek_packet_id(packet: &[u8]) -> Result<u32> {
     let (header, _) = read_varint_u32(packet)?;
     Ok(header & PID_MASK)
 }
 
-/// 패킷들을 다시 배치로 묶는다 (`[VarInt len][packet]` 반복).
+/// Reassembles packets into a batch (`[VarInt len][packet]` repeated).
 pub fn build_batch(packets: &[Vec<u8>]) -> Vec<u8> {
     let mut out = Vec::new();
     for p in packets {
@@ -147,8 +147,8 @@ mod tests {
             let mut buf = Vec::new();
             write_varint_u32(v, &mut buf);
             let (decoded, n) = read_varint_u32(&buf).unwrap();
-            assert_eq!(decoded, v, "값 {v} 불일치");
-            assert_eq!(n, buf.len(), "값 {v} 소비 길이 불일치");
+            assert_eq!(decoded, v, "value {v} mismatch");
+            assert_eq!(n, buf.len(), "value {v} consumed wrong byte count");
         }
     }
 
@@ -165,34 +165,34 @@ mod tests {
 
     #[test]
     fn varint_truncated_errors() {
-        // 연속 비트만 있고 끝나지 않음
+        // all continuation bits set, never terminates
         assert!(read_varint_u32(&[0x80, 0x80]).is_err());
     }
 
-    /// 헤더 인코딩: packetId | senderSubId<<10 | recipientSubId<<12 → peek 가 ID만 뽑아야.
+    /// Header encoding: packetId | senderSubId<<10 | recipientSubId<<12 — peek must extract only the ID.
     #[test]
     fn peek_id_ignores_subclient_bits() {
-        let packet_id = 0x8b; // 예: 139
-        let header = packet_id | (1u32 << 10) | (2u32 << 12); // sub-client 비트 섞기
+        let packet_id = 0x8b; // e.g. 139
+        let header = packet_id | (1u32 << 10) | (2u32 << 12); // mix in sub-client bits
         let mut packet = Vec::new();
         write_varint_u32(header, &mut packet);
         packet.extend_from_slice(b"payload");
         assert_eq!(peek_packet_id(&packet).unwrap(), packet_id);
     }
 
-    /// 여러 패킷 배치 round-trip: build → split → 같은 내용.
+    /// Multi-packet batch round-trip: build → split → identical contents.
     #[test]
     fn batch_roundtrip_multi() {
         let mk = |id: u32, body: &[u8]| {
             let mut p = Vec::new();
-            write_varint_u32(id, &mut p); // 헤더(=ID, subclient 0)
+            write_varint_u32(id, &mut p); // header (== ID, subclient 0)
             p.extend_from_slice(body);
             p
         };
         let packets = vec![
             mk(1, b"login"),
-            mk(0x52, b""),                       // 빈 바디 패킷
-            mk(0x3a, &[0u8; 500]),               // 큰 바디(2바이트 VarInt 길이)
+            mk(0x52, b""),                       // empty body packet
+            mk(0x3a, &[0u8; 500]),               // large body (2-byte VarInt length)
         ];
         let batch = build_batch(&packets);
         let split = split_batch(&batch).unwrap();
@@ -200,7 +200,7 @@ mod tests {
         for (orig, got) in packets.iter().zip(split.iter()) {
             assert_eq!(*got, orig.as_slice());
         }
-        // ID peek 확인
+        // verify ID peek
         assert_eq!(peek_packet_id(split[0]).unwrap(), 1);
         assert_eq!(peek_packet_id(split[1]).unwrap(), 0x52);
         assert_eq!(peek_packet_id(split[2]).unwrap(), 0x3a);
@@ -211,7 +211,7 @@ mod tests {
         // 0x80 0x01 = 128 (unsigned VarLong)
         let (v, n) = read_varint_u64(&[0x80, 0x01]).unwrap();
         assert_eq!((v, n), (128, 2));
-        // 큰 값
+        // large value
         let (v, n) = read_varint_u64(&[0xff, 0xff, 0xff, 0xff, 0x0f]).unwrap();
         assert_eq!((v, n), (0xffff_ffff, 5));
     }
@@ -227,10 +227,10 @@ mod tests {
 
     #[test]
     fn split_rejects_overflow_length() {
-        // 길이 VarInt 가 버퍼보다 큼
+        // declared length exceeds actual buffer size
         let mut bad = Vec::new();
-        write_varint_u32(100, &mut bad); // 길이 100 선언
-        bad.extend_from_slice(b"short"); // 실제론 5바이트
+        write_varint_u32(100, &mut bad); // declares length 100
+        bad.extend_from_slice(b"short"); // only 5 bytes follow
         assert!(split_batch(&bad).is_err());
     }
 }

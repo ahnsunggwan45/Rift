@@ -1,9 +1,9 @@
-//! 다운스트림 핸드셰이크용 패킷 생성/파싱 (프록시가 새 서버에 클라 행세할 때).
+//! Packet construction and parsing for the downstream handshake (proxy acting as client to a new backend server).
 //!
-//! 프록시가 *보내는* 패킷: RequestNetworkSettings, ResourcePackClientResponse.
-//! 프록시가 *읽는* 값: Login 의 protocol, StartGame 의 actorRuntimeId.
+//! Packets the proxy *sends*: RequestNetworkSettings, ResourcePackClientResponse.
+//! Values the proxy *reads*: protocol from Login, actorRuntimeId from StartGame.
 
-#![allow(dead_code)] // 핸드셰이크 드라이버 배선 전까지 일부 미사용
+#![allow(dead_code)] // Some items unused until the handshake driver is wired up
 
 use anyhow::{Context, Result};
 
@@ -32,7 +32,7 @@ const GAMERULE_TYPE_BOOL: u32 = 1;
 const GAMERULE_TYPE_INT: u32 = 2;
 const GAMERULE_TYPE_FLOAT: u32 = 3;
 
-// BossEvent eventType (전환 teardown 추적용).
+// BossEvent eventType (tracked for transition teardown).
 pub const BOSS_EVENT_TYPE_SHOW: u8 = 0;
 pub const BOSS_EVENT_TYPE_HIDE: u8 = 2;
 
@@ -43,7 +43,7 @@ pub const RP_STATUS_COMPLETED: u8 = 4;
 // PlayStatus status
 pub const PLAY_STATUS_PLAYER_SPAWN: u32 = 3;
 
-// PlayerAction action id (zigzag VarInt). 차원전환 ACK = 14 (PMMP PlayerAction::DIMENSION_CHANGE_ACK).
+// PlayerAction action id (zigzag VarInt). Dimension change ACK = 14 (PMMP PlayerAction::DIMENSION_CHANGE_ACK).
 pub const PLAYER_ACTION_DIMENSION_CHANGE_DONE: i32 = 14;
 
 // DimensionIds.
@@ -53,7 +53,7 @@ pub const DIM_END: i32 = 2;
 
 const GAME_PACKET: u8 = 0xfe;
 
-/// RequestNetworkSettings 패킷: `[VarInt 0xc1][BE u32 protocol]`.
+/// RequestNetworkSettings packet: `[VarInt 0xc1][BE u32 protocol]`.
 pub fn request_network_settings(protocol: u32) -> Vec<u8> {
     let mut p = Vec::new();
     write_varint_u32(ID_REQUEST_NETWORK_SETTINGS, &mut p);
@@ -61,7 +61,7 @@ pub fn request_network_settings(protocol: u32) -> Vec<u8> {
     p
 }
 
-/// ResourcePackClientResponse 패킷: `[VarInt 0x08][status u8][LE u16 packIds=0]`.
+/// ResourcePackClientResponse packet: `[VarInt 0x08][status u8][LE u16 packIds=0]`.
 pub fn resource_pack_client_response(status: u8) -> Vec<u8> {
     let mut p = Vec::new();
     write_varint_u32(ID_RESOURCE_PACK_CLIENT_RESPONSE, &mut p);
@@ -70,8 +70,8 @@ pub fn resource_pack_client_response(status: u8) -> Vec<u8> {
     p
 }
 
-/// 단일 패킷을 게임패킷 메시지로 프레이밍한다.
-/// `compressed=false` 면 `[0xfe][raw batch]`, true 면 `[0xfe][comp_type][압축 batch]`.
+/// Frames a single packet as a game packet message.
+/// If `compressed=false`: `[0xfe][raw batch]`; if `true`: `[0xfe][comp_type][compressed batch]`.
 pub fn frame_game_packet(packet: &[u8], compressed: bool, comp_type: u8) -> Result<Vec<u8>> {
     let batch = build_batch(&[packet.to_vec()]);
     let mut msg = vec![GAME_PACKET];
@@ -84,32 +84,32 @@ pub fn frame_game_packet(packet: &[u8], compressed: bool, comp_type: u8) -> Resu
     Ok(msg)
 }
 
-/// Login 패킷에서 protocol(헤더 다음 BE u32)을 추출한다.
+/// Extracts the protocol version (BE u32 immediately after the header) from a Login packet.
 pub fn extract_login_protocol(login_packet: &[u8]) -> Result<u32> {
     let (_, header_len) = read_varint_u32(login_packet)?;
     let bytes = login_packet
         .get(header_len..header_len + 4)
-        .context("Login protocol 필드 부족")?;
+        .context("Login packet too short: missing protocol field")?;
     Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
-/// StartGame 패킷에서 actorRuntimeId 를 추출한다.
+/// Extracts the actorRuntimeId from a StartGame packet.
 pub fn extract_start_game_runtime_id(start_game: &[u8]) -> Result<u64> {
     Ok(extract_start_game_info(start_game)?.0)
 }
 
-/// StartGame 에서 (actorRuntimeId, 스폰위치[x,y,z], playerGamemode) 를 추출한다.
-/// 레이아웃: `[header][actorUniqueId zigzag-VarLong][actorRuntimeId VarLong][playerGamemode zigzag-VarInt][pos 3×LE f32]...`
+/// Extracts `(actorRuntimeId, spawn position [x,y,z], playerGamemode)` from a StartGame packet.
+/// Layout: `[header][actorUniqueId zigzag-VarLong][actorRuntimeId VarLong][playerGamemode zigzag-VarInt][pos 3×LE f32]...`
 pub fn extract_start_game_info(start_game: &[u8]) -> Result<(u64, [f32; 3], i32)> {
     let (_, header_len) = read_varint_u32(start_game)?;
     let mut off = header_len;
-    let (_unique, n1) = read_zigzag_i64(start_game.get(off..).context("StartGame unique id 부족")?)?;
+    let (_unique, n1) = read_zigzag_i64(start_game.get(off..).context("StartGame truncated: missing unique id")?)?;
     off += n1;
-    let (runtime, n2) = read_varint_u64(start_game.get(off..).context("StartGame runtime id 부족")?)?;
+    let (runtime, n2) = read_varint_u64(start_game.get(off..).context("StartGame truncated: missing runtime id")?)?;
     off += n2;
-    let (gamemode, n3) = read_zigzag_i32(start_game.get(off..).context("StartGame gamemode 부족")?)?;
+    let (gamemode, n3) = read_zigzag_i32(start_game.get(off..).context("StartGame truncated: missing gamemode")?)?;
     off += n3;
-    let pos = start_game.get(off..off + 12).context("StartGame position 부족")?;
+    let pos = start_game.get(off..off + 12).context("StartGame truncated: missing position")?;
     let x = f32::from_le_bytes([pos[0], pos[1], pos[2], pos[3]]);
     let y = f32::from_le_bytes([pos[4], pos[5], pos[6], pos[7]]);
     let z = f32::from_le_bytes([pos[8], pos[9], pos[10], pos[11]]);
@@ -137,15 +137,15 @@ pub fn play_status(status: u32) -> Vec<u8> {
     p
 }
 
-/// PlayStatusPacket 의 status(BE u32) 를 읽는다. (전환 핸드셰이크에서 PLAYER_SPAWN 감지용)
+/// Reads the status (BE u32) from a PlayStatusPacket. Used to detect PLAYER_SPAWN during the transition handshake.
 pub fn read_play_status(packet: &[u8]) -> Result<u32> {
     let (_, hl) = read_varint_u32(packet)?;
-    let b = packet.get(hl..hl + 4).context("PlayStatus status 필드 부족")?;
+    let b = packet.get(hl..hl + 4).context("PlayStatus packet too short: missing status field")?;
     Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 /// RequestChunkRadiusPacket: `[header][radius zigzag][maxRadius u8]`.
-/// 프록시가 새 서버에 보내 청크 스트리밍을 시작시킨다(이게 빠져서 청크가 0개였음).
+/// Sent by the proxy to the new backend to initiate chunk streaming (omitting this caused zero chunks to arrive).
 pub fn request_chunk_radius(radius: i32, max_radius: u8) -> Vec<u8> {
     let mut p = Vec::new();
     write_varint_u32(ID_REQUEST_CHUNK_RADIUS, &mut p);
@@ -155,7 +155,7 @@ pub fn request_chunk_radius(radius: i32, max_radius: u8) -> Vec<u8> {
 }
 
 /// SetLocalPlayerAsInitializedPacket: `[header][actorRuntimeId UVarLong]`.
-/// 프록시가 새 서버에 보내 doFirstSpawn(엔티티/후속 스트리밍)을 트리거한다.
+/// Sent by the proxy to the new backend to trigger doFirstSpawn (entity spawn and subsequent streaming).
 pub fn set_local_player_as_initialized(runtime_id: u64) -> Vec<u8> {
     let mut p = Vec::new();
     write_varint_u32(ID_SET_LOCAL_PLAYER_INITIALIZED, &mut p);
@@ -164,8 +164,8 @@ pub fn set_local_player_as_initialized(runtime_id: u64) -> Vec<u8> {
 }
 
 /// SetPlayerGameTypePacket: `[header][gamemode zigzag-VarInt]`.
-/// 전환 시 클라 게임모드 HUD(체력바 표시 등)를 새 서버 값으로 동기화.
-/// (StartGame 을 클라에 안 보내므로 게임모드를 따로 알려줘야 한다.)
+/// Synchronizes the client's game mode HUD (health bar, etc.) to the new backend's value on transition.
+/// Required because StartGame is not forwarded to the client, so the game mode must be sent separately.
 pub fn set_player_game_type(gamemode: i32) -> Vec<u8> {
     let mut p = Vec::new();
     write_varint_u32(ID_SET_PLAYER_GAME_TYPE, &mut p);
@@ -173,8 +173,8 @@ pub fn set_player_game_type(gamemode: i32) -> Vec<u8> {
     p
 }
 
-/// GameRulesChangedPacket: `[header][gameRules 배열(isStartGame=false)]`.
-/// body 는 extract_start_game_gamerules() 가 만든 재인코딩 배열.
+/// GameRulesChangedPacket: `[header][gameRules array (isStartGame=false)]`.
+/// The body is the re-encoded array produced by `extract_start_game_gamerules()`.
 pub fn game_rules_changed(body: &[u8]) -> Vec<u8> {
     let mut p = Vec::with_capacity(2 + body.len());
     write_varint_u32(ID_GAME_RULES_CHANGED, &mut p);
@@ -182,23 +182,23 @@ pub fn game_rules_changed(body: &[u8]) -> Vec<u8> {
     p
 }
 
-/// BossEventPacket(HIDE) — 1.26.30 평탄화 레이아웃(8필드 무조건 인코딩).
-/// 전환 시 옛 서버 보스바를 클라에서 제거.
+/// BossEventPacket(HIDE) — flattened 1.26.30 layout (8 fields always encoded).
+/// Removes the previous backend's boss bar from the client on transition.
 pub fn boss_event_hide(boss_unique_id: i64) -> Vec<u8> {
     let mut p = Vec::new();
     write_varint_u32(ID_BOSS_EVENT, &mut p);
     write_zigzag_i64(boss_unique_id, &mut p); // bossActorUniqueId
     write_zigzag_i64(0, &mut p); // playerActorUniqueId
     p.push(BOSS_EVENT_TYPE_HIDE); // eventType
-    write_varint_u32(0, &mut p); // title (빈 string)
-    write_varint_u32(0, &mut p); // filteredTitle (빈 string)
+    write_varint_u32(0, &mut p); // title (empty string)
+    write_varint_u32(0, &mut p); // filteredTitle (empty string)
     p.extend_from_slice(&0f32.to_le_bytes()); // healthPercent
     p.push(0); // color
     p.push(0); // overlay
     p
 }
 
-/// RemoveObjectivePacket — 전환 시 옛 서버 스코어보드(목표)를 클라에서 제거.
+/// RemoveObjectivePacket — clears the previous backend's scoreboard objective from the client on transition.
 pub fn remove_objective(name: &str) -> Vec<u8> {
     let mut p = Vec::new();
     write_varint_u32(ID_REMOVE_OBJECTIVE, &mut p);
@@ -207,7 +207,7 @@ pub fn remove_objective(name: &str) -> Vec<u8> {
     p
 }
 
-/// 오프셋의 string(UnsignedVarInt 길이 + 바이트)을 읽는다. (값, 새 오프셋은 호출측이 계산 불필요)
+/// Reads a string (UnsignedVarInt length prefix + bytes) at the given offset. Returns the string value; the caller does not need to compute a new offset.
 fn read_string_at(buf: &[u8], off: usize) -> Option<String> {
     let (len, n) = read_varint_u32(buf.get(off..)?).ok()?;
     let start = off + n;
@@ -215,7 +215,7 @@ fn read_string_at(buf: &[u8], off: usize) -> Option<String> {
     Some(String::from_utf8_lossy(buf.get(start..end)?).into_owned())
 }
 
-/// BossEventPacket 에서 (bossActorUniqueId, eventType)을 추출(보스바 추적용). best-effort.
+/// Extracts `(bossActorUniqueId, eventType)` from a BossEventPacket for boss bar tracking. Best-effort.
 pub fn parse_boss_event(pkt: &[u8]) -> Option<(i64, u8)> {
     let (_, hl) = read_varint_u32(pkt).ok()?;
     let mut off = hl;
@@ -226,46 +226,48 @@ pub fn parse_boss_event(pkt: &[u8]) -> Option<(i64, u8)> {
     Some((boss_id, *pkt.get(off)?))
 }
 
-/// SetDisplayObjectivePacket 에서 objectiveName(displaySlot 다음 두번째 string)을 추출. best-effort.
+/// Extracts the objectiveName (the second string, after displaySlot) from a SetDisplayObjectivePacket. Best-effort.
 pub fn parse_set_display_objective_name(pkt: &[u8]) -> Option<String> {
     let (_, hl) = read_varint_u32(pkt).ok()?;
     let off = skip_string(pkt, hl).ok()?; // displaySlot
     read_string_at(pkt, off)
 }
 
-/// RemoveObjectivePacket 에서 objectiveName 을 추출. best-effort.
+/// Extracts the objectiveName from a RemoveObjectivePacket. Best-effort.
 pub fn parse_remove_objective_name(pkt: &[u8]) -> Option<String> {
     let (_, hl) = read_varint_u32(pkt).ok()?;
     read_string_at(pkt, hl)
 }
 
-/// string(UnsignedVarInt 길이 + 바이트)을 건너뛴 새 오프셋.
+/// Returns the offset after skipping a string (UnsignedVarInt length prefix + bytes).
 fn skip_string(buf: &[u8], off: usize) -> Result<usize> {
-    let (len, n) = read_varint_u32(buf.get(off..).context("string 길이 부족")?)?;
+    let (len, n) = read_varint_u32(buf.get(off..).context("string length prefix missing")?)?;
     let end = off + n + len as usize;
     if end > buf.len() {
-        anyhow::bail!("string 잘림");
+        anyhow::bail!("string truncated");
     }
     Ok(end)
 }
 
-/// StartGame 의 gameRules 를 추출해 GameRulesChangedPacket 본문으로 **재인코딩**한다.
-/// StartGame(isStartGame=true)은 int 게임룰 값을 VarInt 로, GameRulesChanged(false)는 LE u32 로
-/// 쓰므로 그대로 복사 불가 → int 만 변환, bool/float 는 그대로. (LevelSettings 필드 워킹)
+/// Extracts the gameRules from a StartGame packet and **re-encodes** them as a GameRulesChangedPacket body.
+/// StartGame (isStartGame=true) encodes int rule values as VarInt; GameRulesChanged (false) uses LE u32 —
+/// so the bytes cannot be copied as-is. Only int values are transcoded; bool and float pass through unchanged.
+/// (This involves walking the LevelSettings fields to reach the gameRules array.)
 ///
-/// 전환 시 클라에 보내 좌표표시 등 게임룰을 새 서버 값으로 맞춘다. 실패 시 Err(전환은 계속).
+/// Sent to the client on transition to apply the new backend's game rules (e.g. showCoordinates).
+/// Returns Err on parse failure; the transition continues regardless.
 pub fn extract_start_game_gamerules(sg: &[u8]) -> Result<Vec<u8>> {
     let (_, hdr) = read_varint_u32(sg)?;
     let mut off = hdr;
 
     fn need(sg: &[u8], off: usize, n: usize) -> Result<()> {
         if off + n > sg.len() {
-            anyhow::bail!("StartGame 잘림 (off={off} need={n} len={})", sg.len());
+            anyhow::bail!("StartGame truncated (off={off} need={n} len={})", sg.len());
         }
         Ok(())
     }
 
-    // StartGame 선행 필드 (header 직후)
+    // StartGame leading fields (immediately after the header)
     let (_, n) = read_zigzag_i64(sg.get(off..).context("actorUniqueId")?)?;
     off += n;
     let (_, n) = read_varint_u64(sg.get(off..).context("actorRuntimeId")?)?;
@@ -357,14 +359,14 @@ pub fn extract_start_game_gamerules(sg: &[u8]) -> Result<Vec<u8>> {
                 body.extend_from_slice(&sg[off..off + 4]);
                 off += 4;
             }
-            other => anyhow::bail!("알 수 없는 게임룰 타입 {other}"),
+            other => anyhow::bail!("unknown game rule type {other}"),
         }
     }
     Ok(body)
 }
 
 /// PlayerActionPacket: `[header][actorRuntimeId UVarLong][action zigzag][blockPos 3×zigzag][resultPos 3×zigzag][face zigzag]`.
-/// 전환 시 차원변경 ACK(DIMENSION_CHANGE_DONE)를 클라에 주입 — 블록/결과 좌표·face 는 0.
+/// Injects a dimension change ACK (DIMENSION_CHANGE_DONE) to the client on transition — block/result coordinates and face are all zero.
 pub fn player_action(runtime_id: u64, action: i32) -> Vec<u8> {
     let mut p = Vec::new();
     write_varint_u32(ID_PLAYER_ACTION, &mut p);
@@ -380,7 +382,7 @@ pub fn player_action(runtime_id: u64, action: i32) -> Vec<u8> {
     p
 }
 
-/// 차원별 바이옴 섹션 수(= 프로토콜 청크 높이 경계 폭). ChunkSerializer::getDimensionChunkBounds 기준.
+/// Returns the number of biome sections per dimension (equals the protocol chunk height span). Based on ChunkSerializer::getDimensionChunkBounds.
 pub fn dimension_biome_sections(dimension: i32) -> usize {
     match dimension {
         DIM_NETHER => 8, // [0,7]
@@ -389,25 +391,25 @@ pub fn dimension_biome_sections(dimension: i32) -> usize {
     }
 }
 
-/// 빈(공기) 청크 페이로드. WDPE/PMMP ChunkSerializer 와 바이트 동일하게 구성:
-/// 빈 서브청크 1개(`08 00`) + 바이옴 팔레트(첫 섹션은 풀, 나머지는 이전-복사 마커) + 보더(0).
-/// 차원 플립 시 로딩 화면 필러로 클라에 보낸다. `biome_sections` = dimension_biome_sections().
+/// Builds an empty (all-air) chunk payload, byte-identical to WDPE/PMMP ChunkSerializer:
+/// one empty sub-chunk (`08 00`), biome palette (first section full, remaining as copy-previous markers), border count (0).
+/// Sent to the client as a loading-screen filler during dimension transitions. `biome_sections` = `dimension_biome_sections()`.
 pub fn empty_chunk_payload(biome_sections: usize) -> Vec<u8> {
     let mut p = Vec::with_capacity(2 + 1 + 512 + 2 + biome_sections + 1);
-    // 빈 서브청크 1개: version 8, 블록 스토리지 레이어 0개.
+    // Single empty sub-chunk: version 8, zero block storage layers.
     p.push(8);
     p.push(0);
-    // 바이옴 섹션 0: bitsPerBlock=1 + runtime 플래그 → (1<<1)|1 = 3. words 512바이트(전부 인덱스 0),
-    // 팔레트 크기 1(zigzag), 팔레트 엔트리 biome 0(zigzag). (ChunkSerializer.php:153-167)
+    // Biome section 0: bitsPerBlock=1 + runtime flag → (1<<1)|1 = 3. 512 zero bytes for words (all index 0),
+    // palette size 1 (zigzag), palette entry biome 0 (zigzag). (ChunkSerializer.php:153-167)
     p.push((1 << 1) | 1);
     p.extend(std::iter::repeat(0u8).take(512));
-    write_zigzag_i32(1, &mut p); // 팔레트 크기 (intentionally zigzag)
+    write_zigzag_i32(1, &mut p); // palette size (intentionally zigzag)
     write_zigzag_i32(0, &mut p); // biome id 0
-    // 나머지 바이옴 섹션: 이전 섹션 복사 마커 (127<<1)|1 = 0xFF.
+    // Remaining biome sections: copy-previous marker (127<<1)|1 = 0xFF.
     for _ in 1..biome_sections {
         p.push((127 << 1) | 1);
     }
-    // 보더 블록 수 0.
+    // Border block count: 0.
     p.push(0);
     p
 }
@@ -420,7 +422,7 @@ pub fn level_chunk(chunk_x: i32, chunk_z: i32, dimension: i32, sub_chunk_count: 
     write_zigzag_i32(chunk_z, &mut p);
     write_zigzag_i32(dimension, &mut p);
     write_varint_u32(sub_chunk_count, &mut p);
-    p.push(0); // cacheEnabled = false (블롭 캐시 미사용)
+    p.push(0); // cacheEnabled = false (blob cache not used)
     write_varint_u32(payload.len() as u32, &mut p);
     p.extend_from_slice(payload);
     p
@@ -435,7 +437,7 @@ mod tests {
     fn request_network_settings_roundtrip() {
         let p = request_network_settings(0x3e9); // 1001
         assert_eq!(peek_packet_id(&p).unwrap(), ID_REQUEST_NETWORK_SETTINGS);
-        // protocol 은 헤더(2바이트 VarInt for 0xc1) 다음 BE u32
+        // protocol is the BE u32 immediately after the header (2-byte VarInt for 0xc1)
         let (_, hl) = read_varint_u32(&p).unwrap();
         assert_eq!(&p[hl..hl + 4], &0x3e9u32.to_be_bytes());
     }
@@ -466,7 +468,7 @@ mod tests {
 
     #[test]
     fn extract_protocol_from_login() {
-        // Login 모형: [header 0x01][BE u32 protocol][...]
+        // Synthetic Login: [header 0x01][BE u32 protocol][...]
         let mut login = Vec::new();
         write_varint_u32(0x01, &mut login);
         login.extend_from_slice(&0x3e9u32.to_be_bytes());
@@ -476,7 +478,7 @@ mod tests {
 
     #[test]
     fn extract_runtime_id_and_pos_from_start_game() {
-        // StartGame 모형: [header 0x0b][uniqueId zigzag][runtimeId varlong][gamemode zigzag][pos 3×LE f32]...
+        // Synthetic StartGame: [header 0x0b][uniqueId zigzag][runtimeId varlong][gamemode zigzag][pos 3×LE f32]...
         let mut sg = Vec::new();
         write_varint_u32(0x0b, &mut sg);
         sg.push(0x0a); // actorUniqueId = 5 (zigzag)
@@ -505,7 +507,7 @@ mod tests {
 
     #[test]
     fn extract_gamerules_transcodes_int_to_le() {
-        // 합성 StartGame: 선행 필드는 0/빈값, gameRules 만 의미있게 채운다.
+        // Synthetic StartGame: leading fields are all zero/empty; only gameRules carries meaningful data.
         let mut sg = Vec::new();
         write_varint_u32(0x0b, &mut sg); // header
         sg.push(0x00); // actorUniqueId zigzag 0
@@ -546,7 +548,7 @@ mod tests {
         sg.push(0); // isPlayerModifiable
         write_varint_u32(GAMERULE_TYPE_INT, &mut sg);
         write_varint_u32(300, &mut sg); // int value as VarInt (StartGame side)
-        sg.extend_from_slice(b"junk-after-gamerules"); // 무시돼야 함
+        sg.extend_from_slice(b"junk-after-gamerules"); // must be ignored by the parser
 
         let body = extract_start_game_gamerules(&sg).unwrap();
         let mut expected = Vec::new();
@@ -563,7 +565,7 @@ mod tests {
         expected.extend_from_slice(&300u32.to_le_bytes()); // int → LE u32 (GameRulesChanged side)
         assert_eq!(body, expected);
 
-        // 래퍼가 헤더를 붙이고 본문을 보존하는지.
+        // verify the wrapper prepends the header and preserves the body.
         let pkt = game_rules_changed(&body);
         assert_eq!(peek_packet_id(&pkt).unwrap(), ID_GAME_RULES_CHANGED);
     }

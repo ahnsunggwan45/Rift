@@ -60,12 +60,15 @@ pub struct FragmentQ {
     fragments: HashMap<u16, Fragment>,
 }
 
-// Rift 하드닝: 미완성 조각의 무한 누적(메모리 고갈 DoS) 방지.
-// 정상 트래픽은 이 한도 근처에도 못 간다 — 한도 초과 조각은 조용히 드롭(신뢰 패킷이면 재전송됨).
+// Rift hardening: prevent unbounded accumulation of incomplete fragments (memory-exhaustion DoS).
+// Normal traffic never comes close to these limits — excess fragments are silently dropped
+// (reliable packets will be retransmitted).
 //
-// compound_size 상한: MTU 1200 기준 16384 조각 ≈ 19MB. 어떤 정상 Bedrock 패킷(청크 배치 포함)보다 훨씬 크다.
+// compound_size cap: at MTU 1200, 16384 fragments ≈ 19 MB — far larger than any legitimate
+// Bedrock packet, including full chunk batches.
 const MAX_COMPOUND_SIZE: u32 = 16384;
-// 동시 미완성 compound 수 상한: 정상은 1~2개. 악의적 다수 compound_id 누적을 차단.
+// Concurrent incomplete-compound cap: normal sessions have 1–2 at most.
+// Blocks malicious accumulation of many distinct compound_ids.
 const MAX_CONCURRENT_COMPOUNDS: usize = 256;
 
 impl FragmentQ {
@@ -76,7 +79,8 @@ impl FragmentQ {
     }
 
     pub fn insert(&mut self, frame: FrameSetPacket) {
-        // 비정상 compound_size(0 또는 과대) 거부 — 거대 조각수 주장으로 누적시키는 공격 차단.
+        // Reject abnormal compound_size (zero or oversized) — blocks accumulation attacks
+        // that claim an inflated fragment count.
         if frame.compound_size == 0 || frame.compound_size > MAX_COMPOUND_SIZE {
             return;
         }
@@ -86,7 +90,8 @@ impl FragmentQ {
                 .unwrap()
                 .insert(frame);
         } else {
-            // 새 compound 인데 동시 미완성이 한도면 거부 — 다수 미완성 compound 누적 DoS 차단.
+            // New compound: reject if we already have too many incomplete compounds —
+            // prevents DoS via accumulation of many distinct incomplete compounds.
             if self.fragments.len() >= MAX_CONCURRENT_COMPOUNDS {
                 return;
             }
@@ -136,20 +141,20 @@ mod tests {
         let mut q = FragmentQ::new();
         q.insert(make(1, MAX_COMPOUND_SIZE + 1, 0));
         q.insert(make(2, 0, 0));
-        assert_eq!(q.size(), 0, "과대/0 compound_size 는 거부되어야 함");
+        assert_eq!(q.size(), 0, "oversized/zero compound_size must be rejected");
     }
 
     #[test]
     fn caps_concurrent_incomplete_compounds() {
         let mut q = FragmentQ::new();
-        // 각 compound 에 조각 1개만 넣어 미완성으로 남긴다 → 누적 시도.
+        // Insert only one fragment per compound to keep each one incomplete — stress-test accumulation.
         for id in 0..(MAX_CONCURRENT_COMPOUNDS as u16 + 50) {
             q.insert(make(id, 4, 0));
         }
         assert_eq!(
             q.size(),
             MAX_CONCURRENT_COMPOUNDS,
-            "동시 미완성 compound 는 상한에서 멈춰야 함"
+            "concurrent incomplete compounds must be capped at the limit"
         );
     }
 
@@ -159,7 +164,7 @@ mod tests {
         q.insert(make(7, 2, 0));
         q.insert(make(7, 2, 1));
         let flushed = q.flush().unwrap();
-        assert_eq!(flushed.len(), 1, "정상 2조각은 재조립되어야 함");
-        assert_eq!(q.size(), 0, "완성된 compound 는 제거되어야 함");
+        assert_eq!(flushed.len(), 1, "a complete 2-fragment compound must be reassembled");
+        assert_eq!(q.size(), 0, "a completed compound must be removed from the queue");
     }
 }

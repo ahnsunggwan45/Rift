@@ -1,23 +1,25 @@
-//! Rift — Phase 1a: RakNet 종단 불투명 릴레이.
+//! Rift — Phase 1a: Opaque RakNet termination relay.
 //!
-//! Phase 0(raw UDP 릴레이)과 달리, 이제 프록시가 **RakNet 레이어를 소유**한다.
-//! `rust-raknet` 의 `RaknetListener` 로 클라 연결을 종단하고, 각 클라마다
-//! `RaknetSocket::connect_with_version` 으로 다운스트림에 별도 RakNet 연결을 연 뒤,
-//! 게임패킷 바이트스트림을 양방향으로 그대로(opaque) 중계한다.
+//! Unlike Phase 0 (raw UDP relay), the proxy now **owns the RakNet layer**.
+//! `rust-raknet`'s `RaknetListener` terminates client connections, and for each
+//! client a separate RakNet connection is opened to the downstream via
+//! `RaknetSocket::connect_with_version`, forwarding the game-packet byte stream
+//! opaquely in both directions.
 //!
-//! 이 단계에선 Bedrock 게임패킷을 해석하지 않는다. 로그인/암호화 핸드셰이크는
-//! 클라↔서버 사이에서 그대로 성립하고(프록시는 바이트만 셔틀), 결과적으로
-//! Phase 0 과 동일하게 "동작하는 연결"이 나온다. 핵심 차이는 RakNet 종단을
-//! 우리가 쥐었다는 것 — 이게 Phase 1b(암호화 종단·패킷 가로채기)의 전제다.
+//! This phase does not parse Bedrock game packets. The login/encryption handshake
+//! is negotiated transparently between client and server (the proxy shuttles bytes),
+//! producing a working connection identical to Phase 0. The key difference is that
+//! we now own the RakNet termination — a prerequisite for Phase 1b (encryption
+//! termination and packet interception).
 
-// 전역 할당자: mimalloc (매 패킷·세션 할당이 잦은 프록시에 유리).
-// optional feature — musl 정적 빌드(--no-default-features)에선 빠지고 system 할당자 사용.
-// profiling 빌드(--features profiling)에선 카운팅 할당자가 우선해 alloc 횟수/바이트를 측정한다.
+// Global allocator: mimalloc (preferred for proxies with frequent per-packet/session allocations).
+// Optional feature — omitted in musl static builds (--no-default-features), falling back to the system allocator.
+// In profiling builds (--features profiling) the counting allocator takes priority to measure alloc counts/bytes.
 #[cfg(all(feature = "mimalloc", not(feature = "profiling")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-// 측정 전용 카운팅 할당자. "Hot Path Allocation = 0" 목표를 /metrics 의 alloc_count 로 검증.
+// Counting allocator for profiling only. Validates the "Hot Path Allocation = 0" goal via /metrics alloc_count.
 #[cfg(feature = "profiling")]
 mod profiling;
 #[cfg(feature = "profiling")]
@@ -55,9 +57,9 @@ fn main() -> Result<()> {
         .init();
 
     let cfg_path = std::env::args().nth(1).unwrap_or_else(|| "config.toml".into());
-    let cfg = Arc::new(Config::load(&cfg_path).with_context(|| format!("설정 로드 실패: {cfg_path}"))?);
+    let cfg = Arc::new(Config::load(&cfg_path).with_context(|| format!("failed to load config: {cfg_path}"))?);
 
-    // 멀티코어 런타임. worker_threads 미지정이면 tokio 기본(논리코어 수)을 쓴다. config 로 튜닝 가능.
+    // Multi-core runtime. Defaults to tokio's default (logical core count) if worker_threads is unset; tunable via config.
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();
     if let Some(n) = cfg.runtime.worker_threads {
@@ -65,7 +67,7 @@ fn main() -> Result<()> {
             builder.worker_threads(n);
         }
     }
-    let rt = builder.build().context("tokio 런타임 생성 실패")?;
+    let rt = builder.build().context("failed to build tokio runtime")?;
     rt.block_on(run(cfg))
 }
 
@@ -73,26 +75,27 @@ async fn run(cfg: Arc<Config>) -> Result<()> {
     let listen_addr = cfg.listen_addr()?;
     let downstream_addr = cfg.default_server_addr()?;
 
-    // MTU 상한 적용(기본 1200, 안정성). 클라↔프록시·프록시↔다운스트림 협상 모두에 반영.
+    // Apply MTU cap (default 1200 for stability). Applies to both client↔proxy and proxy↔downstream negotiation.
     rift_raknet::set_mtu(cfg.listener.mtu);
-    tracing::info!(mtu = cfg.listener.mtu, "MTU 상한 설정");
+    tracing::info!(mtu = cfg.listener.mtu, "MTU cap applied");
 
     let mut listener = RaknetListener::bind(&listen_addr)
         .await
-        .map_err(|e| anyhow!("리스너 bind 실패 {listen_addr}: {e:?}"))?;
+        .map_err(|e| anyhow!("listener bind failed {listen_addr}: {e:?}"))?;
 
-    // MOTD: config 에 [motd] 가 있으면 그걸 직접 광고(다운스트림 조회 불필요).
-    // 없으면 시작 시 default_server 의 MOTD 를 조회해 그대로 광고.
+    // MOTD: if [motd] is set in config, advertise it directly (no downstream query needed).
+    // Otherwise, query the default_server MOTD at startup and advertise it as-is.
     match &cfg.motd {
         Some(motd) => {
             let s = motd.to_motd_string(listen_addr.port());
-            tracing::info!(motd = %s, "프록시 고정 MOTD 사용");
+            tracing::info!(motd = %s, "using static proxy MOTD");
             if let Err(e) = listener.set_full_motd(s) {
-                tracing::warn!("set_full_motd 실패: {e:?}");
+                tracing::warn!("set_full_motd failed: {e:?}");
             }
         }
         None => {
-            // 타임아웃 필수 — 백엔드가 안 닿으면 ping 이 무한 대기해 프록시 시작 자체가 멈춘다.
+            // Timeout is required — without it, an unreachable backend causes ping to block indefinitely,
+            // preventing proxy startup.
             let probe = tokio::time::timeout(
                 std::time::Duration::from_secs(3),
                 RaknetSocket::ping(&downstream_addr),
@@ -100,13 +103,13 @@ async fn run(cfg: Arc<Config>) -> Result<()> {
             .await;
             match probe {
                 Ok(Ok((latency, motd))) => {
-                    tracing::info!(latency_ms = latency, motd = %motd, "다운스트림 MOTD 조회 성공");
+                    tracing::info!(latency_ms = latency, motd = %motd, "downstream MOTD fetched");
                     if let Err(e) = listener.set_full_motd(motd) {
-                        tracing::warn!("set_full_motd 실패: {e:?}");
+                        tracing::warn!("set_full_motd failed: {e:?}");
                     }
                 }
                 other => {
-                    tracing::warn!("다운스트림 MOTD 조회 실패/타임아웃({other:?}) — 기본 MOTD 사용");
+                    tracing::warn!("downstream MOTD fetch failed/timeout ({other:?}) — using default MOTD");
                     listener
                         .set_motd("Rift", 1001, "1.26.30", "1.26.30", "Survival", listen_addr.port())
                         .await;
@@ -118,19 +121,20 @@ async fn run(cfg: Arc<Config>) -> Result<()> {
     let force_vv = cfg.features.force_vibrant_visuals;
     let channel_transfer = cfg.features.channel_transfer;
 
-    // 리소스팩: enabled 면 packs/ 폴더 로드. 핸드셰이크 임계 경로라 로드 실패/0개면 비활성으로 폴백.
+    // Resource packs: if enabled, load from the packs/ directory. Falls back to disabled if load fails or yields 0 packs,
+    // since this is on the handshake critical path.
     let packs: Option<Arc<packs::PackStore>> = if cfg.resource_packs.enabled {
         match packs::load(&cfg.resource_packs.folder, cfg.resource_packs.force) {
             Ok(store) if !store.is_empty() => {
-                tracing::info!(count = store.packs.len(), folder = %cfg.resource_packs.folder, "리소스팩 서빙 활성");
+                tracing::info!(count = store.packs.len(), folder = %cfg.resource_packs.folder, "resource pack serving enabled");
                 Some(Arc::new(store))
             }
             Ok(_) => {
-                tracing::warn!(folder = %cfg.resource_packs.folder, "resource_packs.enabled 이나 로드된 팩 0개 — 서빙 비활성");
+                tracing::warn!(folder = %cfg.resource_packs.folder, "resource_packs.enabled but 0 packs loaded — serving disabled");
                 None
             }
             Err(e) => {
-                tracing::error!("리소스팩 로드 실패: {e} — 서빙 비활성");
+                tracing::error!("resource pack load failed: {e} — serving disabled");
                 None
             }
         }
@@ -140,25 +144,25 @@ async fn run(cfg: Arc<Config>) -> Result<()> {
 
     let metrics = Arc::new(metrics::Metrics::default());
     metrics.spawn_logger(cfg.metrics.log_interval_secs);
-    // 성능 데이터 시계열 수집(선택). 실서버에서 켜두고 나중에 파일 받아 분석.
+    // Optional time-series metrics collection. Can be left enabled on production servers for later analysis.
     if let Some(hist) = &cfg.metrics.history_file {
         metrics.spawn_history(hist.clone(), cfg.metrics.history_interval_secs);
-        tracing::info!(file = %hist, "메트릭 히스토리 기록 시작 (JSONL)");
+        tracing::info!(file = %hist, "metrics history recording started (JSONL)");
     }
 
-    // 세션 레지스트리(콘솔/웹의 조회·조작 단일 출처) + 콘솔 stop 용 종료 신호.
+    // Session registry (single source of truth for console/web queries and control) + shutdown signal for console stop.
     let registry = Arc::new(registry::Registry::default());
     let shutdown = Arc::new(tokio::sync::Notify::new());
 
-    // 웹 모니터링(선택): [metrics] web_addr 지정 시 HTTP 대시보드/JSON 노출.
+    // Optional web monitoring: exposes HTTP dashboard/JSON when [metrics] web_addr is set.
     if let Some(wa) = &cfg.metrics.web_addr {
         match wa.parse::<std::net::SocketAddr>() {
             Ok(addr) => web::spawn(metrics.clone(), registry.clone(), addr),
-            Err(e) => tracing::warn!(web_addr = %wa, "web_addr 파싱 실패 — 웹 모니터링 비활성: {e}"),
+            Err(e) => tracing::warn!(web_addr = %wa, "web_addr parse failed — web monitoring disabled: {e}"),
         }
     }
 
-    // 콘솔 명령(stdin). 백그라운드 실행이면 EOF 로 조용히 끝난다.
+    // Console commands (stdin). Exits silently on EOF when running in the background.
     console::spawn(registry.clone(), metrics.clone(), shutdown.clone());
 
     listener.listen().await;
@@ -168,31 +172,31 @@ async fn run(cfg: Arc<Config>) -> Result<()> {
         %downstream_addr,
         force_vibrant_visuals = force_vv,
         channel_transfer,
-        "Rift Phase 1b-A (평문 종단 + 인터셉션) 시작"
+        "Rift Phase 1b-A (plaintext termination + interception) started"
     );
 
     loop {
         let client = tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                tracing::info!("종료 신호(Ctrl+C) 수신 — 새 연결 수락 중단, 종료");
+                tracing::info!("shutdown signal (Ctrl+C) received — stopping accept loop");
                 break;
             }
             _ = shutdown.notified() => {
-                tracing::info!("콘솔 stop — 새 연결 수락 중단, 종료");
+                tracing::info!("console stop — stopping accept loop");
                 break;
             }
             accept = listener.accept() => match accept {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::warn!("accept 실패: {e:?}");
+                    tracing::warn!("accept failed: {e:?}");
                     continue;
                 }
             },
         };
         let peer = client.peer_addr().ok();
-        // 클라가 협상한 RakNet 버전으로 다운스트림에 연결해야 호환된다.
+        // Connect to downstream using the RakNet version negotiated by the client for compatibility.
         let version = client.raknet_version().unwrap_or(11);
-        tracing::info!(?peer, raknet_version = version, "클라 연결 수락");
+        tracing::info!(?peer, raknet_version = version, "client connection accepted");
 
         let cfg = cfg.clone();
         let packs = packs.clone();
@@ -202,23 +206,23 @@ async fn run(cfg: Arc<Config>) -> Result<()> {
             let server = match RaknetSocket::connect_with_version(&downstream_addr, version).await {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::warn!(?peer, "다운스트림 연결 실패: {e:?}");
+                    tracing::warn!(?peer, "downstream connection failed: {e:?}");
                     let _ = client.close().await;
                     return;
                 }
             };
-            tracing::info!(?peer, %downstream_addr, "다운스트림 연결 성립, 릴레이 시작");
+            tracing::info!(?peer, %downstream_addr, "downstream connected, starting relay");
             relay(client, server, cfg, version, packs, metrics, registry).await;
-            tracing::info!(?peer, "세션 종료");
+            tracing::info!(?peer, "session closed");
         });
     }
     Ok(())
 }
 
-/// 클라↔서버 게임패킷을 중계한다.
-/// - up(클라→서버): 불투명 통과 (+ 전환 리플레이용 Login 1회 캡처).
-/// - down(서버→클라): VV flip / TransferPacket 감지 시 디코드, 그 외 불투명 통과.
-/// 한쪽이 끊기면(recv 에러) 양쪽을 닫고 종료한다.
+/// Relays game packets between client and server.
+/// - up (client→server): opaque pass-through (+ one-time Login capture for transfer replay).
+/// - down (server→client): decode on VV flip / TransferPacket detection; otherwise opaque pass-through.
+/// If either side disconnects (recv error), both sockets are closed and the session ends.
 async fn relay(
     client: RaknetSocket,
     mut server: RaknetSocket,
@@ -235,14 +239,15 @@ async fn relay(
     let mut current_server = cfg.listener.default_server.clone();
     metrics.on_connect(&current_server);
 
-    // 세션 등록(콘솔/웹 조회·조작용). control 채널로 콘솔 transfer/kick 을 select 루프에 주입.
+    // Register session (for console/web queries and control). The control channel injects console transfer/kick
+    // commands into the select loop.
     let peer = client
         .peer_addr()
         .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
     let (ctl_tx, mut ctl_rx) = tokio::sync::mpsc::channel::<registry::Control>(8);
     let session_id = registry.register(peer, current_server.clone(), ctl_tx);
     let mut identity_set = false;
-    // 주기적으로 클라↔프록시 RTT(핑)를 레지스트리에 갱신(웹/콘솔 표시용).
+    // Periodically update the client↔proxy RTT (ping) in the registry for web/console display.
     let mut rtt_tick = tokio::time::interval(std::time::Duration::from_secs(3));
 
     loop {
@@ -254,11 +259,11 @@ async fn relay(
             }
             cmd = ctl_rx.recv() => match cmd {
                 Some(registry::Control::Transfer(t)) => {
-                    tracing::info!(session_id, target = %t, "콘솔 전환 요청");
+                    tracing::info!(session_id, target = %t, "console transfer requested");
                     transfer_to = Some(t);
                 }
                 Some(registry::Control::Kick) => {
-                    tracing::info!(session_id, "콘솔 kick");
+                    tracing::info!(session_id, "console kick");
                     break;
                 }
                 None => {}
@@ -268,7 +273,7 @@ async fn relay(
                     metrics.on_bytes_up(data.len());
                     match intercept::intercept_up(&mut state, &data, packs.as_deref()) {
                         Outcome::Forward => {
-                            // zero-copy: recv 한 Bytes 를 복사 없이 그대로 다운스트림으로.
+                            // zero-copy: forward the received Bytes to downstream without copying.
                             if server.send_bytes(data, Reliability::ReliableOrdered).await.is_err() {
                                 break;
                             }
@@ -283,7 +288,7 @@ async fn relay(
                                 break;
                             }
                         }
-                        Outcome::Transfer(_) => {} // up 에선 발생 안 함
+                        Outcome::Transfer(_) => {} // never occurs on the upstream path
                     }
                 }
                 Err(_) => break,
@@ -294,7 +299,7 @@ async fn relay(
                     metrics.on_bytes_down(data.len());
                     match intercept::intercept_down(&mut state, &data, force_vv, channel_transfer, packs.as_deref()) {
                         Outcome::Forward => {
-                            // zero-copy: recv 한 Bytes 를 복사 없이 그대로 클라로.
+                            // zero-copy: forward the received Bytes to the client without copying.
                             if client.send_bytes(data, Reliability::ReliableOrdered).await.is_err() {
                                 break;
                             }
@@ -311,44 +316,45 @@ async fn relay(
                             }
                         }
                         Outcome::Transfer(target) => {
-                            // select! borrow 해제 후 처리 (server 교체 필요).
+                            // Handle after the select! borrow is released (requires swapping server).
                             transfer_to = Some(target);
                         }
                     }
                 }
-                // 현재 다운스트림이 끊김. 전환 중이 아니면 세션 종료.
+                // Current downstream disconnected. End the session unless a transfer is in progress.
                 Err(_) => break,
             },
         }
 
-        // Login 캡처 직후 이름/XUID 를 1회 추출해 레지스트리에 채운다(콘솔 list·웹 표시용).
+        // Extract name/XUID from the captured Login packet once and populate the registry (for console list and web display).
         if !identity_set {
             if let Some(login) = state.captured_login() {
                 let id = login::extract(login);
                 if id.name.is_some() || id.xuid.is_some() {
                     registry.set_identity(session_id, id.name, id.xuid);
                 }
-                identity_set = true; // 추출 실패해도 재파싱 안 함
+                identity_set = true; // skip re-parsing even if extraction failed
             }
         }
 
         if let Some(target) = transfer_to {
             match do_transfer(&cfg, &mut state, &target, version, &client, &mut server).await {
                 Ok(true) => {
-                    tracing::info!(%target, "채널이동 스위치 완료");
+                    tracing::info!(%target, "transfer complete");
                     metrics.on_transfer(&current_server, &target);
                     registry.set_server(session_id, target.clone());
                     current_server = target;
                 }
                 Ok(false) => {
-                    // 전환 취소(대상 불가·거부·로비 redirect 등). 플레이어는 현재 서버에 그대로 — 튕기지 않음.
+                    // Transfer cancelled (target unreachable, rejected, lobby redirect, etc.).
+                    // Player remains on the current server — no disconnect.
                     metrics.on_transfer_failed();
-                    tracing::info!(%target, current = %current_server, "채널이동 취소 — 현재 서버 유지");
+                    tracing::info!(%target, current = %current_server, "transfer cancelled — keeping current server");
                 }
                 Err(e) => {
-                    // 스왑 이후 치명적 실패(복구 불가) — 세션 종료.
+                    // Fatal failure after the swap (unrecoverable) — end the session.
                     metrics.on_transfer_failed();
-                    tracing::warn!(%target, "채널이동 중 치명적 오류: {e} — 세션 종료");
+                    tracing::warn!(%target, "fatal error during transfer: {e} — closing session");
                     break;
                 }
             }
@@ -360,7 +366,7 @@ async fn relay(
     let _ = server.close().await;
 }
 
-/// 여러 게임패킷 메시지를 순서대로 보낸다. 하나라도 실패하면 false.
+/// Sends multiple game-packet messages in order. Returns false on the first failure.
 async fn send_all(sock: &RaknetSocket, msgs: &[Vec<u8>]) -> bool {
     for m in msgs {
         if sock.send(m, Reliability::ReliableOrdered).await.is_err() {
@@ -370,23 +376,24 @@ async fn send_all(sock: &RaknetSocket, msgs: &[Vec<u8>]) -> bool {
     true
 }
 
-/// 단일 게임패킷을 압축(zlib)해 소켓으로 보낸다 (전환 시퀀스 주입용).
+/// Compresses a single game packet (zlib) and sends it over the socket (used for transfer sequence injection).
 async fn send_pkt(sock: &RaknetSocket, pkt: &[u8]) -> Result<()> {
     let msg = packets::frame_game_packet(pkt, true, compression::ZLIB)?;
     sock.send(&msg, Reliability::ReliableOrdered)
         .await
-        .map_err(|e| anyhow!("패킷 전송 실패: {e:?}"))?;
+        .map_err(|e| anyhow!("packet send failed: {e:?}"))?;
     Ok(())
 }
 
-/// 투명 채널이동 수행 (connect-before-disconnect). Spectrum 검증 시퀀스 이식.
+/// Performs a transparent channel transfer (connect-before-disconnect). Ported from the Spectrum verification sequence.
 ///
-/// 핵심: ① 새 서버(B)를 StartGame 에서 멈추지 말고 **풀 스폰까지** 구동(RequestChunkRadius →
-/// 청크 스트림 버퍼 → PlayStatus). ② 클라에 **차원 플립**(현재≠다른 차원이어야 실제 전환됨)으로
-/// 옛 월드를 비우고 빈 청크로 로딩 화면을 채운다. ③ 스왑 후 B 에 SetLocalPlayerAsInitialized 로
-/// doFirstSpawn 트리거. ④ overworld 복귀 + 버퍼된 실제 스폰 스트림 재생.
+/// Key steps: ① Drive the new server (B) through **full spawn** rather than stopping at StartGame
+/// (RequestChunkRadius → chunk stream buffer → PlayStatus). ② Send the client a **dimension flip**
+/// (must differ from the current dimension) to flush the old world (chunk/entity cache) and fill the
+/// loading screen with empty chunks. ③ After the swap, trigger doFirstSpawn on B via
+/// SetLocalPlayerAsInitialized. ④ Return to overworld and replay the buffered real spawn stream.
 ///
-/// 엔티티 ID 재작성은 없음 — 결정론 ID 플러그인(crc32(XUID))이 A·B 에서 같은 id 를 보장한다.
+/// No entity ID rewriting — the deterministic ID plugin (crc32(XUID)) guarantees the same ID on both A and B.
 async fn do_transfer(
     cfg: &Arc<Config>,
     state: &mut intercept::SessionState,
@@ -395,26 +402,27 @@ async fn do_transfer(
     client: &RaknetSocket,
     server: &mut RaknetSocket,
 ) -> Result<bool> {
-    // 반환: Ok(true)=전환 완료, Ok(false)=전환 취소(현재 서버 유지·튕기지 않음), Err=스왑 후 치명적(세션 종료).
-    // 아래 std::mem::replace(스왑) 전까지의 실패는 옛 서버 연결이 그대로라 전부 복구 가능 → Ok(false).
+    // Returns: Ok(true)=transfer complete, Ok(false)=transfer cancelled (current server kept, no disconnect),
+    // Err=fatal failure after swap (session closed).
+    // Failures before std::mem::replace (swap) leave the old server connection intact and are fully recoverable → Ok(false).
     let Some(login) = state.captured_login().map(|l| l.to_vec()) else {
-        tracing::warn!(%target, "Login 미캡처 — 전환 취소(현재 서버 유지)");
+        tracing::warn!(%target, "Login not captured — transfer cancelled (keeping current server)");
         return Ok(false);
     };
     let addr = match cfg.resolve_server(target) {
         Ok(a) => a,
         Err(e) => {
-            tracing::warn!(%target, "전환 대상 해석 실패({e}) — 전환 취소(현재 서버 유지)");
+            tracing::warn!(%target, "failed to resolve transfer target ({e}) — transfer cancelled (keeping current server)");
             return Ok(false);
         }
     };
-    tracing::info!(%target, %addr, "채널이동 시작 — 새 다운스트림 풀 스폰 핸드셰이크");
+    tracing::info!(%target, %addr, "transfer started — performing full spawn handshake with new downstream");
 
-    // 핸드셰이크 실패(대상 불가/로비가 즉시 redirect 등): 옛 서버 그대로 → 플레이어 유지.
+    // Handshake failure (target unreachable / lobby immediately redirects, etc.): keep old server, player stays.
     let ready = match downstream::connect_and_handshake(addr, version, &login).await {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!(%target, "전환 대상 핸드셰이크 실패({e}) — 전환 취소(현재 서버 유지)");
+            tracing::warn!(%target, "handshake with transfer target failed ({e}) — transfer cancelled (keeping current server)");
             return Ok(false);
         }
     };
@@ -428,16 +436,17 @@ async fn do_transfer(
         runtime_id,
         gamemode,
         spawn_msgs = ready.spawn_buffer.len(),
-        "새 다운스트림 스폰 준비 — 클라 전환 시퀀스"
+        "new downstream ready for spawn — sending client transfer sequence"
     );
 
-    // 차원: 다운스트림 월드는 전부 overworld(0) 가정. Spectrum 과 동일하게
-    // Play=Nether(현재와 달라야 클라가 실제 전환)로 플립, Clear=Overworld 복귀.
+    // Dimension: all downstream worlds are assumed to be overworld (0). Mirroring Spectrum:
+    // flip to Nether (must differ from the current dimension for the client to actually switch),
+    // then restore to Overworld.
     let final_dim = packets::DIM_OVERWORLD;
     let flip_dim = packets::DIM_NETHER;
     let empty = packets::empty_chunk_payload(packets::dimension_biome_sections(final_dim));
 
-    // (1) Play: 더미 차원으로 플립 → 클라가 옛 월드(청크/엔티티 캐시)를 비운다.
+    // (1) Play: flip to dummy dimension → client flushes old world (chunk/entity cache).
     send_pkt(client, &packets::change_dimension(flip_dim, pos, false)).await?;
     send_pkt(
         client,
@@ -445,7 +454,7 @@ async fn do_transfer(
     )
     .await?;
 
-    // (2) 플립 차원 로딩 필러: 스폰 청크 주변 9×9 빈 청크.
+    // (2) Loading screen filler for the flip dimension: 9×9 empty chunks around the spawn chunk.
     for dx in -4..=4 {
         for dz in -4..=4 {
             send_pkt(
@@ -456,17 +465,18 @@ async fn do_transfer(
         }
     }
 
-    // 게임모드 HUD 동기화: StartGame 을 클라에 안 보내므로 게임모드(체력바 표시 등)가 옛 서버
-    // 값에 머문다 → 새 서버 gamemode 를 명시적으로 알려준다.
+    // Gamemode HUD sync: since StartGame is not forwarded to the client, the gamemode (health bar display, etc.)
+    // would remain at the old server's value — explicitly notify the client of the new server's gamemode.
     send_pkt(client, &packets::set_player_game_type(gamemode)).await?;
 
-    // 게임룰 동기화 (best-effort): 좌표표시 등 새 서버 게임룰 적용. 추출 실패해도 전환은 계속.
+    // Game rule sync (best-effort): apply new server game rules (e.g. show coordinates). Transfer continues even if extraction fails.
     match packets::extract_start_game_gamerules(&ready.start_game) {
         Ok(body) => send_pkt(client, &packets::game_rules_changed(&body)).await?,
-        Err(e) => tracing::warn!(%target, "게임룰 추출 실패(스킵): {e}"),
+        Err(e) => tracing::warn!(%target, "game rule extraction failed (skipping): {e}"),
     }
 
-    // 옛 서버 상태 teardown: 추적한 보스바/스코어보드를 클라에서 제거(차원 플립으로 안 지워지는 잔재).
+    // Old server state teardown: remove tracked boss bars and scoreboards from the client
+    // (residual state not cleared by the dimension flip).
     let (old_bossbars, old_objectives) = state.take_tracked();
     for id in &old_bossbars {
         send_pkt(client, &packets::boss_event_hide(*id)).await?;
@@ -478,18 +488,18 @@ async fn do_transfer(
         tracing::info!(
             bossbars = old_bossbars.len(),
             objectives = old_objectives.len(),
-            "옛 서버 상태 teardown"
+            "old server state torn down"
         );
     }
 
-    // (3) 다운스트림 스왑 A→B, 옛 A 닫기. ← 커밋 지점: 여기부터의 실패는 복구 불가(치명적).
+    // (3) Swap downstream A→B, close old A. ← Commit point: failures from here are unrecoverable (fatal).
     let old = std::mem::replace(server, ready.socket);
     let _ = old.close().await;
 
-    // (4) DoSpawn → B: doFirstSpawn(엔티티/후속 청크 스트리밍) 트리거.
+    // (4) DoSpawn → B: triggers doFirstSpawn (entity/chunk streaming).
     send_pkt(server, &packets::set_local_player_as_initialized(runtime_id)).await?;
 
-    // (5) Clear: overworld 복귀 + 스폰.
+    // (5) Clear: restore overworld + spawn.
     send_pkt(client, &packets::play_status(packets::PLAY_STATUS_PLAYER_SPAWN)).await?;
     send_pkt(client, &packets::change_dimension(final_dim, pos, true)).await?;
     send_pkt(
@@ -499,18 +509,18 @@ async fn do_transfer(
     .await?;
     send_pkt(client, &packets::play_status(packets::PLAY_STATUS_PLAYER_SPAWN)).await?;
 
-    // (6) 버퍼된 실제 스폰 스트림(청크/인벤/엔티티) 재생 — 이미 프레이밍된 메시지라 그대로 전송.
-    //     이제 클라가 overworld 라 청크를 수용한다.
+    // (6) Replay buffered real spawn stream (chunks/inventory/entities) — messages are already framed, send as-is.
+    //     The client is now in overworld and will accept chunks.
     for msg in &ready.spawn_buffer {
         client
             .send(msg, Reliability::ReliableOrdered)
             .await
-            .map_err(|e| anyhow!("스폰 스트림 재생 실패: {e:?}"))?;
+            .map_err(|e| anyhow!("spawn stream replay failed: {e:?}"))?;
     }
 
-    // 새 서버 초기 보스바/스코어보드로 추적 시드 (다음 전환 teardown 대비).
+    // Seed tracked state with the new server's initial boss bars/scoreboards (for the next transfer teardown).
     state.seed_tracked(ready.bossbars, ready.objectives);
 
-    tracing::info!(%target, "채널이동 시퀀스 전송 완료");
+    tracing::info!(%target, "transfer sequence sent");
     Ok(true)
 }
