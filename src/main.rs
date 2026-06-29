@@ -581,6 +581,9 @@ async fn do_transfer(
     for name in &old_objectives {
         send_pkt(client, &packets::remove_objective(name)).await?;
     }
+    // Clear weather (rain/thunder) carried over from the old server — matches WaterdogPE injectClearWeather.
+    send_pkt(client, &packets::level_event(packets::LEVEL_EVENT_STOP_RAIN, 10000)).await?;
+    send_pkt(client, &packets::level_event(packets::LEVEL_EVENT_STOP_THUNDER, 0)).await?;
     if !old_bossbars.is_empty() || !old_objectives.is_empty() || removed_entities > 0 {
         tracing::info!(
             bossbars = old_bossbars.len(),

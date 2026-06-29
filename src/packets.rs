@@ -37,6 +37,11 @@ pub const ID_REMOVE_ACTOR: u32 = 0x0e;
 pub const ID_ADD_ITEM_ACTOR: u32 = 0x0f;
 pub const ID_ADD_PAINTING: u32 = 0x16;
 pub const ID_NETWORK_CHUNK_PUBLISHER_UPDATE: u32 = 0x79;
+pub const ID_LEVEL_EVENT: u32 = 0x19;
+
+// LevelEvent ids used to clear weather carried over from the old server on transfer.
+pub const LEVEL_EVENT_STOP_RAIN: i32 = 3003;
+pub const LEVEL_EVENT_STOP_THUNDER: i32 = 3004;
 
 // GameRuleType.
 const GAMERULE_TYPE_BOOL: u32 = 1;
@@ -152,6 +157,18 @@ pub fn network_chunk_publisher_update(pos: [f32; 3], radius: u32) -> Vec<u8> {
     write_zigzag_i32(pos[2].floor() as i32, &mut p); // blockPos z (signed)
     write_varint_u32(radius, &mut p); // radius
     p.extend_from_slice(&0u32.to_le_bytes()); // savedChunks count (LE u32) = 0
+    p
+}
+
+/// LevelEventPacket: `[header][eventId zigzag][position 3×LE f32][eventData zigzag]`. Position is zero
+/// (global event). Used on transfer to clear weather (rain/thunder) carried over from the old server,
+/// matching WaterdogPE's injectClearWeather.
+pub fn level_event(event_id: i32, data: i32) -> Vec<u8> {
+    let mut p = Vec::new();
+    write_varint_u32(ID_LEVEL_EVENT, &mut p);
+    write_zigzag_i32(event_id, &mut p);
+    p.extend_from_slice(&[0u8; 12]); // position (0,0,0): 3× LE f32
+    write_zigzag_i32(data, &mut p);
     p
 }
 
@@ -656,6 +673,18 @@ mod tests {
         assert_eq!(parse_actor_unique_id(&p).unwrap(), 123456789);
         // negative ids round-trip through zigzag too
         assert_eq!(parse_actor_unique_id(&remove_actor(-42)).unwrap(), -42);
+    }
+
+    #[test]
+    fn level_event_format() {
+        let p = level_event(LEVEL_EVENT_STOP_RAIN, 10000);
+        assert_eq!(peek_packet_id(&p).unwrap(), ID_LEVEL_EVENT);
+        let (_, hl) = read_varint_u32(&p).unwrap();
+        let (ev, n) = read_zigzag_i32(&p[hl..]).unwrap();
+        assert_eq!(ev, LEVEL_EVENT_STOP_RAIN);
+        // position (12 bytes) then eventData zigzag
+        let (data, _) = read_zigzag_i32(&p[hl + n + 12..]).unwrap();
+        assert_eq!(data, 10000);
     }
 
     #[test]
