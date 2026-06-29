@@ -42,7 +42,6 @@ mod registry;
 mod web;
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use rift_raknet::{RaknetListener, RaknetSocket, Reliability};
@@ -386,69 +385,9 @@ async fn send_pkt(sock: &RaknetSocket, pkt: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// How long to wait for the client's dimension-change ack before proceeding anyway (fallback).
-/// Kept short so a missed ack only adds a small delay; once detection works the ack arrives well
-/// within this and the wait returns immediately.
-const DIM_ACK_TIMEOUT: Duration = Duration::from_millis(1500);
-
 /// NetworkChunkPublisherUpdate radius sent during a transfer dimension change (mirrors WaterdogPE's
 /// small value — the filler chunks cover it, so the client finalizes the transition immediately).
 const CHUNK_PUBLISH_RADIUS: u32 = 3;
-
-/// Waits for the client to confirm a dimension change (PlayerAction DIMENSION_CHANGE_ACK), draining
-/// and discarding other client packets meanwhile. Returns on the ack or after `timeout` — the
-/// transfer proceeds regardless, so a missing/late ack never freezes the player.
-async fn await_dim_change_ack(client: &RaknetSocket, compression_on: bool, timeout: Duration) -> bool {
-    tokio::time::timeout(timeout, async {
-        loop {
-            match client.recv().await {
-                Ok(data) if client_msg_is_dim_change_ack(data.as_ref(), compression_on) => return true,
-                Ok(_) => {}            // ignore other client packets during the transfer
-                Err(_) => return false, // client disconnected
-            }
-        }
-    })
-    .await
-    .unwrap_or(false) // timed out → proceed anyway
-}
-
-/// True if a client game-packet message contains a PlayerAction(DIMENSION_CHANGE_ACK). Best-effort.
-fn client_msg_is_dim_change_ack(msg: &[u8], compression_on: bool) -> bool {
-    if msg.first() != Some(&0xfe) {
-        return false;
-    }
-    let payload = &msg[1..];
-    let (comp_type, batch_data) = if compression_on {
-        match payload.split_first() {
-            Some((&t, rest)) => (t, rest),
-            None => return false,
-        }
-    } else {
-        (crate::compression::NONE, payload)
-    };
-    let batch = match crate::compression::decompress(comp_type, batch_data) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::debug!(comp_type, "transfer wait: client batch decode failed: {e}");
-            return false;
-        }
-    };
-    let Ok(pkts) = crate::framing::split_batch(&batch) else {
-        return false;
-    };
-    let mut acked = false;
-    for p in &pkts {
-        if crate::framing::peek_packet_id(p).ok() == Some(packets::ID_PLAYER_ACTION) {
-            // DIAGNOSTIC: log the action so we can see what the client actually sends on a dim change.
-            let action = packets::parse_player_action(p);
-            tracing::info!(?action, "transfer wait: client PlayerAction");
-            if action == Some(packets::PLAYER_ACTION_DIMENSION_CHANGE_DONE) {
-                acked = true;
-            }
-        }
-    }
-    acked
-}
 
 /// Performs a transparent channel transfer (connect-before-disconnect). Ported from the Spectrum verification sequence.
 ///
@@ -559,10 +498,9 @@ async fn do_transfer(
     )
     .await?;
 
-    // Wait for the client to confirm the flip completed (its own DIMENSION_CHANGE_ACK), then proceed.
-    // Falls back after the timeout so a missing ack never hangs the transfer.
-    let acked = await_dim_change_ack(client, state.compression_on(), DIM_ACK_TIMEOUT).await;
-    tracing::info!(acked, phase = "flip", %target, "transfer dimension-change ack");
+    // No blocking ack-wait: it froze the relay (and the player) for up to the timeout while do_transfer
+    // ran. The publisher update + server-side ACK above let the client complete the flip on its own;
+    // the client's own ack flows through normally once the relay resumes.
 
     // Gamemode HUD sync: since StartGame is not forwarded to the client, the gamemode (health bar display, etc.)
     // would remain at the old server's value — explicitly notify the client of the new server's gamemode.
@@ -620,11 +558,7 @@ async fn do_transfer(
     )
     .await?;
 
-    // Wait for the client to confirm the final dimension change (now that it has real chunks) so it
-    // fully re-initializes on the target world — and so this ack is consumed here rather than leaking
-    // to the new downstream, which never sent a ChangeDimension. Falls back after the timeout.
-    let acked = await_dim_change_ack(client, state.compression_on(), DIM_ACK_TIMEOUT).await;
-    tracing::info!(acked, phase = "target", %target, "transfer dimension-change ack");
+    // No blocking ack-wait (see the flip phase above) — the transfer no longer freezes player movement.
 
     // Seed tracked state with the new server's initial boss bars/scoreboards/entities (for the next transfer teardown).
     state.seed_tracked(ready.bossbars, ready.objectives, ready.entities);
