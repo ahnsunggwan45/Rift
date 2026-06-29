@@ -321,15 +321,21 @@ async fn relay(
 
         if let Some(target) = transfer_to {
             match do_transfer(&cfg, &mut state, &target, version, &client, &mut server).await {
-                Ok(()) => {
+                Ok(true) => {
                     tracing::info!(%target, "채널이동 스위치 완료");
                     metrics.on_transfer(&current_server, &target);
                     registry.set_server(session_id, target.clone());
                     current_server = target;
                 }
-                Err(e) => {
+                Ok(false) => {
+                    // 전환 취소(대상 불가·거부·로비 redirect 등). 플레이어는 현재 서버에 그대로 — 튕기지 않음.
                     metrics.on_transfer_failed();
-                    tracing::warn!(%target, "채널이동 실패: {e} — 세션 종료");
+                    tracing::info!(%target, current = %current_server, "채널이동 취소 — 현재 서버 유지");
+                }
+                Err(e) => {
+                    // 스왑 이후 치명적 실패(복구 불가) — 세션 종료.
+                    metrics.on_transfer_failed();
+                    tracing::warn!(%target, "채널이동 중 치명적 오류: {e} — 세션 종료");
                     break;
                 }
             }
@@ -375,15 +381,30 @@ async fn do_transfer(
     version: u8,
     client: &RaknetSocket,
     server: &mut RaknetSocket,
-) -> Result<()> {
-    let login = state
-        .captured_login()
-        .ok_or_else(|| anyhow!("Login 미캡처 — 전환 불가"))?
-        .to_vec();
-    let addr = cfg.resolve_server(target)?;
+) -> Result<bool> {
+    // 반환: Ok(true)=전환 완료, Ok(false)=전환 취소(현재 서버 유지·튕기지 않음), Err=스왑 후 치명적(세션 종료).
+    // 아래 std::mem::replace(스왑) 전까지의 실패는 옛 서버 연결이 그대로라 전부 복구 가능 → Ok(false).
+    let Some(login) = state.captured_login().map(|l| l.to_vec()) else {
+        tracing::warn!(%target, "Login 미캡처 — 전환 취소(현재 서버 유지)");
+        return Ok(false);
+    };
+    let addr = match cfg.resolve_server(target) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(%target, "전환 대상 해석 실패({e}) — 전환 취소(현재 서버 유지)");
+            return Ok(false);
+        }
+    };
     tracing::info!(%target, %addr, "채널이동 시작 — 새 다운스트림 풀 스폰 핸드셰이크");
 
-    let ready = downstream::connect_and_handshake(addr, version, &login).await?;
+    // 핸드셰이크 실패(대상 불가/로비가 즉시 redirect 등): 옛 서버 그대로 → 플레이어 유지.
+    let ready = match downstream::connect_and_handshake(addr, version, &login).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(%target, "전환 대상 핸드셰이크 실패({e}) — 전환 취소(현재 서버 유지)");
+            return Ok(false);
+        }
+    };
     let runtime_id = ready.runtime_id;
     let pos = ready.spawn_pos;
     let gamemode = ready.gamemode;
@@ -448,7 +469,7 @@ async fn do_transfer(
         );
     }
 
-    // (3) 다운스트림 스왑 A→B, 옛 A 닫기.
+    // (3) 다운스트림 스왑 A→B, 옛 A 닫기. ← 커밋 지점: 여기부터의 실패는 복구 불가(치명적).
     let old = std::mem::replace(server, ready.socket);
     let _ = old.close().await;
 
@@ -478,5 +499,5 @@ async fn do_transfer(
     state.seed_tracked(ready.bossbars, ready.objectives);
 
     tracing::info!(%target, "채널이동 시퀀스 전송 완료");
-    Ok(())
+    Ok(true)
 }
