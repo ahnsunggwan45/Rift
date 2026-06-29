@@ -31,6 +31,7 @@ const ID_RESOURCE_PACKS_INFO: u32 = 0x06;
 const ID_RESOURCE_PACK_STACK: u32 = 0x07;
 const ID_START_GAME: u32 = 0x0b;
 const ID_PLAY_STATUS: u32 = 0x02;
+const ID_DISCONNECT: u32 = 0x05;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const RECV_TIMEOUT: Duration = Duration::from_secs(10);
@@ -155,11 +156,23 @@ async fn drive(addr: SocketAddr, raknet_version: u8, login_packet: &[u8]) -> Res
                     )?;
                     raknet_send(&socket, &rcr).await?;
                 }
-                ID_PLAY_STATUS if got_start_game => {
-                    if packets::read_play_status(pkt).ok() == Some(packets::PLAY_STATUS_PLAYER_SPAWN)
-                    {
+                ID_PLAY_STATUS => {
+                    let st = packets::read_play_status(pkt).ok();
+                    if got_start_game && st == Some(packets::PLAY_STATUS_PLAYER_SPAWN) {
                         saw_player_spawn = true;
+                    } else if let Some(s) = st {
+                        // 스폰 외 PlayStatus = 로그인 실패 코드일 수 있음(1/2=버전 불일치, 7=서버 가득 등). 진단.
+                        tracing::warn!(%addr, play_status = s, "핸드셰이크 중 비-스폰 PlayStatus");
                     }
+                }
+                ID_DISCONNECT => {
+                    // 다운스트림이 핸드셰이크 중 kick. 사유 문자열이 페이로드에 있어 lossy 로 찍어 진단한다.
+                    let dump: String = String::from_utf8_lossy(pkt)
+                        .chars()
+                        .map(|c| if c.is_control() { ' ' } else { c })
+                        .take(180)
+                        .collect();
+                    tracing::warn!(%addr, raw = %dump.trim(), "다운스트림 Disconnect(kick) 수신 — raw 에 사유 포함");
                 }
                 // 새 서버 초기 보스바/스코어보드 추적.
                 packets::ID_BOSS_EVENT => {
