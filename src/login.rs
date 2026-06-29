@@ -45,16 +45,53 @@ fn parse(pkt: &[u8]) -> Option<Identity> {
         return None;
     }
     let chain_json = &cr[4..chain_end];
-
     let v: serde_json::Value = serde_json::from_slice(chain_json).ok()?;
-    let chain = v.get("chain")?.as_array()?;
-    // extraData 를 가진 JWT(보통 마지막)에서 displayName/XUID 추출.
-    for jwt in chain {
-        if let Some(id) = jwt.as_str().and_then(identity_from_jwt) {
-            return Some(id);
+
+    let jwts = collect_chain_jwts(&v);
+    let mut xuid_only: Option<String> = None;
+    for jwt in &jwts {
+        if let Some(id) = identity_from_jwt(jwt) {
+            if id.name.is_some() {
+                return Some(id); // 이름 찾으면 즉시 반환
+            }
+            if xuid_only.is_none() {
+                xuid_only = id.xuid;
+            }
         }
     }
-    None
+
+    // 이름 추출 실패 — Bedrock 버전마다 chain 포맷이 달라서일 수 있다. 포맷 파악용 1회 진단 로깅.
+    if let Some(obj) = v.as_object() {
+        let keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        tracing::warn!(?keys, jwt_count = jwts.len(), "login: displayName 추출 실패 — chain 포맷 확인 요망");
+    }
+    xuid_only.map(|xuid| Identity { name: None, xuid: Some(xuid) })
+}
+
+/// chain JWT 문자열들을 모은다. 알려진 포맷 모두 대응:
+///  - `{"chain":[...]}`              (구 포맷)
+///  - `{"Certificate":"{...chain...}"}` (신 포맷, 문자열 안에 중첩)
+///  - 순수 배열 `[...]`
+fn collect_chain_jwts(v: &serde_json::Value) -> Vec<String> {
+    fn as_str_vec(val: &serde_json::Value) -> Option<Vec<String>> {
+        Some(
+            val.as_array()?
+                .iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect(),
+        )
+    }
+    if let Some(c) = v.get("chain").and_then(as_str_vec) {
+        return c;
+    }
+    if let Some(cert) = v.get("Certificate").and_then(|c| c.as_str()) {
+        if let Ok(inner) = serde_json::from_str::<serde_json::Value>(cert) {
+            if let Some(c) = inner.get("chain").and_then(as_str_vec) {
+                return c;
+            }
+        }
+    }
+    as_str_vec(v).unwrap_or_default()
 }
 
 fn identity_from_jwt(token: &str) -> Option<Identity> {
@@ -63,12 +100,13 @@ fn identity_from_jwt(token: &str) -> Option<Identity> {
         .decode(payload_b64)
         .ok()?;
     let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let extra = v.get("extraData")?;
-    let name = extra
+    // displayName/XUID 는 보통 extraData 안에 있으나, 버전에 따라 페이로드 최상위에 있기도 하다.
+    let src = v.get("extraData").unwrap_or(&v);
+    let name = src
         .get("displayName")
         .and_then(|x| x.as_str())
         .map(str::to_string);
-    let xuid = extra.get("XUID").and_then(|x| x.as_str()).map(str::to_string);
+    let xuid = src.get("XUID").and_then(|x| x.as_str()).map(str::to_string);
     if name.is_none() && xuid.is_none() {
         return None;
     }
@@ -141,5 +179,45 @@ mod tests {
         let id = extract(&pkt);
         assert_eq!(id.name.as_deref(), Some("Steve"));
         assert_eq!(id.xuid.as_deref(), Some("2535"));
+    }
+
+    // 헤더(1) + protocol(4 BE) + connReq(VarUint len + [LE u32 chainLen + chainJSON]) 로 합성 Login 생성.
+    fn synth_login(chain_json: &str) -> Vec<u8> {
+        let cb = chain_json.as_bytes();
+        let mut cr = Vec::new();
+        cr.extend_from_slice(&(cb.len() as u32).to_le_bytes());
+        cr.extend_from_slice(cb);
+        let mut pkt = vec![0x01u8, 0, 0, 0, 100]; // 헤더 + protocol
+        let mut len = cr.len() as u32;
+        loop {
+            let mut b = (len & 0x7f) as u8;
+            len >>= 7;
+            if len != 0 {
+                b |= 0x80;
+            }
+            pkt.push(b);
+            if len == 0 {
+                break;
+            }
+        }
+        pkt.extend_from_slice(&cr);
+        pkt
+    }
+
+    fn jwt_with(extra: serde_json::Value) -> String {
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::json!({ "extraData": extra }).to_string());
+        format!("hdr.{b64}.sig")
+    }
+
+    #[test]
+    fn extracts_from_nested_certificate_format() {
+        // 신 포맷: 최상위 {"Certificate": "<json string with chain>"}.
+        let jwt = jwt_with(serde_json::json!({"displayName": "Alex", "XUID": "9001"}));
+        let inner = serde_json::json!({ "chain": [jwt] }).to_string();
+        let chain = serde_json::json!({"AuthenticationType": 2, "Certificate": inner}).to_string();
+        let id = extract(&synth_login(&chain));
+        assert_eq!(id.name.as_deref(), Some("Alex"));
+        assert_eq!(id.xuid.as_deref(), Some("9001"));
     }
 }

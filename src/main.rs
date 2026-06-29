@@ -91,20 +91,28 @@ async fn run(cfg: Arc<Config>) -> Result<()> {
                 tracing::warn!("set_full_motd 실패: {e:?}");
             }
         }
-        None => match RaknetSocket::ping(&downstream_addr).await {
-            Ok((latency, motd)) => {
-                tracing::info!(latency_ms = latency, motd = %motd, "다운스트림 MOTD 조회 성공");
-                if let Err(e) = listener.set_full_motd(motd) {
-                    tracing::warn!("set_full_motd 실패: {e:?}");
+        None => {
+            // 타임아웃 필수 — 백엔드가 안 닿으면 ping 이 무한 대기해 프록시 시작 자체가 멈춘다.
+            let probe = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                RaknetSocket::ping(&downstream_addr),
+            )
+            .await;
+            match probe {
+                Ok(Ok((latency, motd))) => {
+                    tracing::info!(latency_ms = latency, motd = %motd, "다운스트림 MOTD 조회 성공");
+                    if let Err(e) = listener.set_full_motd(motd) {
+                        tracing::warn!("set_full_motd 실패: {e:?}");
+                    }
+                }
+                other => {
+                    tracing::warn!("다운스트림 MOTD 조회 실패/타임아웃({other:?}) — 기본 MOTD 사용");
+                    listener
+                        .set_motd("Rift", 1000, "1.21.0", "1.21.0", "Survival", listen_addr.port())
+                        .await;
                 }
             }
-            Err(e) => {
-                tracing::warn!("다운스트림 MOTD 조회 실패({e:?}), 기본 MOTD 사용");
-                listener
-                    .set_motd("Rift", 1000, "1.21.0", "1.21.0", "Survival", listen_addr.port())
-                    .await;
-            }
-        },
+        }
     }
 
     let force_vv = cfg.features.force_vibrant_visuals;
