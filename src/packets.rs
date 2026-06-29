@@ -27,9 +27,11 @@ pub const ID_BOSS_EVENT: u32 = 0x4a;
 pub const ID_SET_DISPLAY_OBJECTIVE: u32 = 0x6b;
 pub const ID_REMOVE_OBJECTIVE: u32 = 0x6a;
 // Actor spawn/despawn — tracked so the previous server's entities can be removed on transfer.
-// AddActor/AddItemActor/AddPainting/RemoveActor all encode actorUniqueId as their first field.
-// (AddPlayer is not tracked: it carries no actorUniqueId, and real players are cleared via the
-//  dimension change plus the new server's PlayerList.)
+// AddActor/AddItemActor/AddPainting/RemoveActor encode actorUniqueId as their first field;
+// AddPlayer (human NPCs — shops, etc.) encodes actorRuntimeId after uuid+username. In PMMP an
+// entity's unique id == runtime id == getId() (verified in Entity.php/Human.php), so RemoveActor
+// with that id despawns any of them.
+pub const ID_ADD_PLAYER: u32 = 0x0c;
 pub const ID_ADD_ACTOR: u32 = 0x0d;
 pub const ID_REMOVE_ACTOR: u32 = 0x0e;
 pub const ID_ADD_ITEM_ACTOR: u32 = 0x0f;
@@ -264,6 +266,15 @@ pub fn parse_actor_unique_id(pkt: &[u8]) -> Option<i64> {
     let (_, hl) = read_varint_u32(pkt).ok()?;
     let (uid, _) = read_zigzag_i64(pkt.get(hl..)?).ok()?;
     Some(uid)
+}
+
+/// Reads actorRuntimeId from an AddPlayerPacket: `[header][uuid 16B][username string][actorRuntimeId UVarLong]…`.
+/// PMMP uses one id per entity (unique == runtime == getId()), so this value is valid for RemoveActor. Best-effort.
+pub fn parse_add_player_runtime_id(pkt: &[u8]) -> Option<i64> {
+    let (_, hl) = read_varint_u32(pkt).ok()?;
+    let off = skip_string(pkt, hl + 16).ok()?; // skip uuid (16 bytes) + username string
+    let (rid, _) = read_varint_u64(pkt.get(off..)?).ok()?;
+    Some(rid as i64)
 }
 
 /// Returns the offset after skipping a string (UnsignedVarInt length prefix + bytes).
@@ -620,6 +631,20 @@ mod tests {
         assert_eq!(parse_actor_unique_id(&p).unwrap(), 123456789);
         // negative ids round-trip through zigzag too
         assert_eq!(parse_actor_unique_id(&remove_actor(-42)).unwrap(), -42);
+    }
+
+    #[test]
+    fn parse_add_player_reads_runtime_id() {
+        // [header][uuid 16B][username string][actorRuntimeId UVarLong][...]
+        let mut p = Vec::new();
+        write_varint_u32(ID_ADD_PLAYER, &mut p);
+        p.extend_from_slice(&[0u8; 16]); // uuid
+        write_varint_u32(4, &mut p);
+        p.extend_from_slice(b"NPC1"); // username
+        write_varint_u64(1234567, &mut p); // actorRuntimeId (== getId() in PMMP)
+        p.extend_from_slice(b"trailing-metadata");
+        assert_eq!(peek_packet_id(&p).unwrap(), ID_ADD_PLAYER);
+        assert_eq!(parse_add_player_runtime_id(&p).unwrap(), 1234567);
     }
 
     #[test]

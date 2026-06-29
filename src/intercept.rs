@@ -55,6 +55,7 @@ const DOWN_INTEREST: [bool; 256] = interest(&[
     packets::ID_BOSS_EVENT,
     packets::ID_SET_DISPLAY_OBJECTIVE,
     packets::ID_REMOVE_OBJECTIVE,
+    packets::ID_ADD_PLAYER,
     packets::ID_ADD_ACTOR,
     packets::ID_ADD_ITEM_ACTOR,
     packets::ID_ADD_PAINTING,
@@ -378,6 +379,12 @@ fn try_intercept(
             // Track actor entities so they can be despawned on the next transfer. Live tracking only
             // sees small batches (large ones are skipped); the initial spawn's entities are captured
             // separately from the new server's spawn buffer (see downstream.rs).
+            packets::ID_ADD_PLAYER if channel_transfer => {
+                // Human NPCs (shops, etc.). actorRuntimeId == getId() in PMMP → valid for RemoveActor.
+                if let Some(id) = packets::parse_add_player_runtime_id(p) {
+                    state.entities.insert(id);
+                }
+            }
             packets::ID_ADD_ACTOR | packets::ID_ADD_ITEM_ACTOR | packets::ID_ADD_PAINTING
                 if channel_transfer =>
             {

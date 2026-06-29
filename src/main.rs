@@ -489,6 +489,9 @@ async fn do_transfer(
         send_pkt(client, &packets::remove_objective(name)).await?;
     }
     for uid in &old_entities {
+        if *uid as u64 == runtime_id {
+            continue; // never despawn the player's own entity (crc32(XUID) is identical on both servers)
+        }
         send_pkt(client, &packets::remove_actor(*uid)).await?;
     }
     if !old_bossbars.is_empty() || !old_objectives.is_empty() || !old_entities.is_empty() {

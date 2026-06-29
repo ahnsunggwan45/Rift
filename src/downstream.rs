@@ -199,6 +199,11 @@ async fn drive(addr: SocketAddr, raknet_version: u8, login_packet: &[u8]) -> Res
                     }
                 }
                 // Track actor entities streamed during spawn (for the next transfer's teardown).
+                packets::ID_ADD_PLAYER => {
+                    if let Some(id) = packets::parse_add_player_runtime_id(pkt) {
+                        track_entities.insert(id);
+                    }
+                }
                 packets::ID_ADD_ACTOR | packets::ID_ADD_ITEM_ACTOR | packets::ID_ADD_PAINTING => {
                     if let Some(uid) = packets::parse_actor_unique_id(pkt) {
                         track_entities.insert(uid);
