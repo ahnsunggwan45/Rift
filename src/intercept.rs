@@ -62,9 +62,13 @@ const DOWN_INTEREST: [bool; 256] = interest(&[
     packets::ID_REMOVE_ACTOR,
 ]);
 
-/// While watching for transfers (after VV is done), batches larger than this (in bytes) are not
-/// decoded — avoids paying for large chunk batches. Transfer packet batches are small (server name + a few bytes).
-const TRANSFER_SCAN_MAX: usize = 512;
+/// Fast-path threshold. Once past the initial VV/RP phase, batches larger than this are forwarded
+/// **opaquely** — no decompress, no decode, no allocation, zero-copy. They are chunk data; every packet
+/// Rift acts on (TransferPacket, entity Add/Remove, resource-pack) is far smaller. Decompressing only
+/// the smaller batches is what keeps the hot path cheap ("don't touch what we don't need to").
+/// Entities in a destination server's full spawn stream are captured separately during the handshake
+/// (downstream.rs), regardless of size, so this cap doesn't drop them on transfer.
+const MAX_DECODE_BATCH_BYTES: usize = 8192;
 
 /// Per-connection session state (shared between the up and down paths).
 #[derive(Default)]
@@ -298,19 +302,20 @@ pub fn intercept_down(
         return Outcome::Forward; // nothing to watch → fully opaque
     }
 
-    // After the VV flip, large batches are normally skipped (avoids decoding chunk data). But with
-    // channel_transfer on we must decode every batch to track entity spawns for teardown: custom
-    // entities (pets, custom models) arrive as large AddActor batches, and the first server's spawn
-    // stream is large too. Skipping them leaves those entities untracked → they ghost after transfer.
-    // (Decode is decompress-only; the original bytes are still forwarded unchanged.)
-    if !watching_vv && !channel_transfer {
+    // FAST PATH: once past the initial VV/RP phase, forward large batches (chunk data) opaquely
+    // without decoding. This is the core "don't touch 99%" rule — the packets we act on (transfers,
+    // entity Add/Remove, RP) are all small, so only the smaller batches are decompressed. Applies
+    // regardless of channel_transfer; entity tracking still works because (a) destination spawn
+    // entities are seeded from the handshake spawn buffer (any size) and (b) live entity spawns are
+    // small batches under this cap.
+    if !watching_vv {
         let payload = &msg[1..];
         let data_len = if state.compression_on {
             payload.len().saturating_sub(1)
         } else {
             payload.len()
         };
-        if data_len > TRANSFER_SCAN_MAX {
+        if data_len > MAX_DECODE_BATCH_BYTES {
             return Outcome::Forward;
         }
     }
@@ -623,11 +628,11 @@ mod tests {
     }
 
     #[test]
-    fn large_undecodable_batch_forwards_safely() {
-        // With channel_transfer on, the size-skip is disabled (entities must be tracked in any batch),
-        // so a large batch is decoded; an undecodable one falls back to Forward via the error guard.
+    fn large_batch_forwarded_opaque_fast_path() {
+        // Fast path: a batch larger than MAX_DECODE_BATCH_BYTES is forwarded opaquely (never decoded),
+        // even with channel_transfer on. This is the "don't touch chunk data" rule.
         let mut state = SessionState { compression_on: true, vv_done: true, ..Default::default() };
-        let big = vec![GAME_PACKET; TRANSFER_SCAN_MAX + 100];
+        let big = vec![GAME_PACKET; MAX_DECODE_BATCH_BYTES + 100];
         assert!(matches!(
             intercept_down(&mut state, &big, true, true, None),
             Outcome::Forward
@@ -635,11 +640,11 @@ mod tests {
     }
 
     #[test]
-    fn large_batch_skipped_when_channel_transfer_off() {
-        // Size-skip still applies when channel_transfer is off (RP-only watching) — avoids chunk decode.
+    fn large_batch_forwarded_opaque_during_rp() {
+        // Same fast-path skip applies during RP serving (vv done) — large batches are never decoded.
         let store = dummy_store();
         let mut state = SessionState { compression_on: true, vv_done: true, rp_serving: true, ..Default::default() };
-        let big = vec![GAME_PACKET; TRANSFER_SCAN_MAX + 100];
+        let big = vec![GAME_PACKET; MAX_DECODE_BATCH_BYTES + 100];
         assert!(matches!(
             intercept_down(&mut state, &big, false, false, Some(&store)),
             Outcome::Forward
