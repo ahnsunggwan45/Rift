@@ -1,0 +1,25 @@
+[Unit]
+Description=Rift (Bedrock 프록시)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# ── 배포 경로에 맞게 수정 ──
+WorkingDirectory=/opt/rift
+ExecStart=/opt/rift/rift-musl /opt/rift/config.toml
+# 비정상 종료 시 자동 재시작
+Restart=on-failure
+RestartSec=3
+# 로그는 journald 로 → journalctl -u rift -f
+StandardOutput=journal
+StandardError=journal
+Environment=RUST_LOG=rift=info
+# UDP 다수 연결 대비 파일 디스크립터 상향
+LimitNOFILE=65536
+
+# ※ systemd 모드에선 stdin 이 없어 콘솔 명령(transfer/kick/stop) 입력 불가.
+#   → 웹 대시보드(:8080) + systemctl 로 관리. 콘솔 명령이 필요하면 screen/tmux 로 실행.
+
+[Install]
+WantedBy=multi-user.target

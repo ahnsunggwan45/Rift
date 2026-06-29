@@ -1,0 +1,43 @@
+# Rift 설정 예시.  복사해서 쓰세요:  cp config.example.toml config.toml
+# (config.toml 은 .gitignore 됩니다 — 실제 서버 주소가 커밋되지 않도록)
+
+[listener]
+host = "0.0.0.0:19132"        # 클라이언트 접속 주소(UDP). Bedrock 기본 포트 19132.
+default_server = "lobby"       # 접속 시 처음 연결될 채널 ([servers] 의 키여야 함)
+mtu = 1200                     # 협상 MTU 상한 (576~1500). 안정성 위해 1200 권장.
+
+# 서버 목록에 표시할 MOTD. 이 섹션을 지우면 default_server 의 MOTD 를 조회해 그대로 광고.
+[motd]
+name = "§l§bRift§r Network"
+sub = "powered by Rift"
+players = 0
+max_players = 500
+protocol = 1001                # 클라 프로토콜 번호 (안 맞아도 보통 접속은 됨)
+version = "1.21.0"             # 표시용 버전 문자열
+gametype = "Survival"
+
+[features]
+force_vibrant_visuals = true   # 다운스트림이 끈 Vibrant Visuals 를 프록시가 되살림
+channel_transfer = true        # 다운스트림 TransferPacket 을 가로채 무중단 채널이동으로 처리
+
+# 리소스팩 서빙 (선택). packs/ 의 .zip/.mcpack 을 프록시가 클라에 서빙 → 전 서버 공통.
+[resource_packs]
+enabled = false                # 켜기 전 인게임 검증 권장
+folder = "packs"
+force = false                  # true = 팩 거부 시 접속 불가
+
+# 멀티코어 튜닝. 생략/0 이면 논리코어 수만큼 자동 사용.
+[runtime]
+# worker_threads = 8
+
+# 관측.
+[metrics]
+log_interval_secs = 0          # >0 이면 주기적으로 throughput/인원 로그 출력
+# web_addr = "127.0.0.1:8080"  # 웹 대시보드 + /metrics·/players JSON.
+                               # 주의: /players 는 이름·IP 노출 → 외부 공개 시 방화벽 뒤에 둘 것.
+
+# 다운스트림 채널. 키 = 채널 이름(transfer 대상), address = 실제 서버 주소(호스트네임 가능).
+[servers]
+lobby    = { address = "127.0.0.1:19133" }
+survival = { address = "127.0.0.1:19134" }
+# creative = { address = "play.example.com:19135" }

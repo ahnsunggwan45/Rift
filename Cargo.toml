@@ -1,0 +1,49 @@
+[package]
+name = "rift"
+version = "0.0.1"
+edition = "2021"
+description = "고성능 경량 Minecraft Bedrock 프록시 (Waterdog 대체 목표) — Phase 0: 투명 UDP 릴레이"
+
+[[bin]]
+name = "rift"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "sync", "signal"] }
+# vendored + patched: ACK 배칭 (per-datagram → 50ms tick). docs/phase1b-design.md 참고.
+rift-raknet = { path = "vendor/rift-raknet" }
+# Phase 1b — Bedrock 패킷 암호화 (AES-256-CTR "fake GCM")
+aes = "0.8"
+ctr = "0.9"
+sha2 = "0.10"
+# Phase 1b — P-384 키 (ECDH 공유비밀 + ECDSA/ES384 JWT 서명, 같은 키 사용)
+p384 = { version = "0.13", features = ["ecdh", "ecdsa", "pkcs8"] }
+rand = "0.8"
+# Phase 1b — Bedrock 로그인/핸드셰이크 JWT (ES384, x5u=DER 공개키)
+base64 = "0.22"
+serde_json = "1"
+# Phase 1b — 배치 압축. zlib는 RAW DEFLATE(헤더 없음, PMMP ZLIB_ENCODING_RAW), snappy는 raw 블록.
+flate2 = "1"
+snap = "1"
+# 성능 — 전역 할당자 (Rust 기본보다 빠른 경우 多). docs/performance.md #12.
+# optional: 유일한 C 의존성. musl 정적 빌드(deploy-anywhere)는 --no-default-features 로 빼면
+# musl-gcc 없이 순수 Rust 정적 링크 가능. 일반 빌드는 default 로 mimalloc 켜짐.
+mimalloc = { version = "0.1", optional = true }
+# 리소스팩 서빙 — .mcpack/.zip 안의 manifest.json 읽기 (uuid/version 추출).
+zip = { version = "2", default-features = false, features = ["deflate"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+# 기본: mimalloc 전역 할당자 사용. musl 정적 빌드 시 --no-default-features 로 끄면
+# C 의존성이 사라져 musl-gcc 없이 순수 Rust 정적 링크가 된다(할당자는 system).
+default = ["mimalloc"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

@@ -1,0 +1,14 @@
+# Rust build
+/target
+**/*.rs.bk
+
+# 사용자별 설정·자산 (예시는 config.example.toml)
+config.toml
+config.local-test.toml
+packs/
+
+# 빌드된 배포 바이너리 (dist-linux 에는 스크립트만 커밋)
+dist-linux/rift
+dist-linux/rift-musl
+dist-linux/rift.stripped
+*.log
