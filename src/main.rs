@@ -439,6 +439,19 @@ async fn do_transfer(
         "new downstream ready for spawn — sending client transfer sequence"
     );
 
+    // Tear down the old server's actor entities BEFORE the dimension flip — RemoveActor is reliably
+    // honored while the client is still in the entity's dimension. (A dimension change does NOT
+    // despawn actor entities client-side, so without this they ghost after transfer.)
+    let (old_bossbars, old_objectives, old_entities) = state.take_tracked();
+    let mut removed_entities = 0usize;
+    for uid in &old_entities {
+        if *uid as u64 == runtime_id {
+            continue; // never despawn the player's own entity (crc32(XUID) identical on both servers)
+        }
+        send_pkt(client, &packets::remove_actor(*uid)).await?;
+        removed_entities += 1;
+    }
+
     // Dimension: all downstream worlds are assumed to be overworld (0). Mirroring Spectrum:
     // flip to Nether (must differ from the current dimension for the client to actually switch),
     // then restore to Overworld.
@@ -478,27 +491,18 @@ async fn do_transfer(
         Err(e) => tracing::warn!(%target, "game rule extraction failed (skipping): {e}"),
     }
 
-    // Old server state teardown: remove tracked boss bars, scoreboards, and actor entities from the
-    // client (residual state not reliably cleared by the dimension flip — actor entities especially
-    // linger as ghosts without explicit RemoveActor).
-    let (old_bossbars, old_objectives, old_entities) = state.take_tracked();
+    // Boss bar / scoreboard teardown (entities were already despawned before the flip, above).
     for id in &old_bossbars {
         send_pkt(client, &packets::boss_event_hide(*id)).await?;
     }
     for name in &old_objectives {
         send_pkt(client, &packets::remove_objective(name)).await?;
     }
-    for uid in &old_entities {
-        if *uid as u64 == runtime_id {
-            continue; // never despawn the player's own entity (crc32(XUID) is identical on both servers)
-        }
-        send_pkt(client, &packets::remove_actor(*uid)).await?;
-    }
-    if !old_bossbars.is_empty() || !old_objectives.is_empty() || !old_entities.is_empty() {
+    if !old_bossbars.is_empty() || !old_objectives.is_empty() || removed_entities > 0 {
         tracing::info!(
             bossbars = old_bossbars.len(),
             objectives = old_objectives.len(),
-            entities = old_entities.len(),
+            entities = removed_entities,
             "old server state torn down"
         );
     }

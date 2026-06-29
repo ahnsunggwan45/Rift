@@ -292,8 +292,12 @@ pub fn intercept_down(
         return Outcome::Forward; // nothing to watch → fully opaque
     }
 
-    // After VV flip, only decode small batches (avoids chunk overhead). Transfer/RP packets are small.
-    if !watching_vv {
+    // After the VV flip, large batches are normally skipped (avoids decoding chunk data). But with
+    // channel_transfer on we must decode every batch to track entity spawns for teardown: custom
+    // entities (pets, custom models) arrive as large AddActor batches, and the first server's spawn
+    // stream is large too. Skipping them leaves those entities untracked → they ghost after transfer.
+    // (Decode is decompress-only; the original bytes are still forwarded unchanged.)
+    if !watching_vv && !channel_transfer {
         let payload = &msg[1..];
         let data_len = if state.compression_on {
             payload.len().saturating_sub(1)
@@ -613,12 +617,25 @@ mod tests {
     }
 
     #[test]
-    fn large_batch_skipped_when_only_transfer_watching() {
+    fn large_undecodable_batch_forwards_safely() {
+        // With channel_transfer on, the size-skip is disabled (entities must be tracked in any batch),
+        // so a large batch is decoded; an undecodable one falls back to Forward via the error guard.
         let mut state = SessionState { compression_on: true, vv_done: true, ..Default::default() };
-        // Large batch treated as chunk data; decode skipped → Forward
         let big = vec![GAME_PACKET; TRANSFER_SCAN_MAX + 100];
         assert!(matches!(
             intercept_down(&mut state, &big, true, true, None),
+            Outcome::Forward
+        ));
+    }
+
+    #[test]
+    fn large_batch_skipped_when_channel_transfer_off() {
+        // Size-skip still applies when channel_transfer is off (RP-only watching) — avoids chunk decode.
+        let store = dummy_store();
+        let mut state = SessionState { compression_on: true, vv_done: true, rp_serving: true, ..Default::default() };
+        let big = vec![GAME_PACKET; TRANSFER_SCAN_MAX + 100];
+        assert!(matches!(
+            intercept_down(&mut state, &big, false, false, Some(&store)),
             Outcome::Forward
         ));
     }
