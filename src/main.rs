@@ -285,6 +285,7 @@ async fn relay(
             },
             down = server.recv() => match down {
                 Ok(data) => {
+                    let fwd_t0 = std::time::Instant::now();
                     metrics.on_bytes_down(data.len());
                     match intercept::intercept_down(&mut state, &data, force_vv, channel_transfer, packs.as_deref()) {
                         Outcome::Forward => {
@@ -292,6 +293,7 @@ async fn relay(
                             if client.send_bytes(data, Reliability::ReliableOrdered).await.is_err() {
                                 break;
                             }
+                            metrics.on_forward(fwd_t0.elapsed());
                         }
                         Outcome::Replace(out) => {
                             if client.send(&out, Reliability::ReliableOrdered).await.is_err() {

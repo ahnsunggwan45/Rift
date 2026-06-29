@@ -137,6 +137,7 @@ tr:last-child td{border-bottom:none}.num{text-align:right}.mut{color:var(--mut)}
     <div class="card" id="alloc_card" style="display:none"><div class="k">할당(누적)</div><div class="v" id="alloc">–</div></div>
     <div class="card"><div class="k">최대 동시</div><div class="v" id="peak">–</div></div>
     <div class="card"><div class="k">누적 송수신</div><div class="v" id="total_bytes">–</div></div>
+    <div class="card"><div class="k">포워드 지연</div><div class="v" id="fwd">–<small> μs</small></div></div>
   </div>
   <h2>서버별 인원</h2>
   <table><thead><tr><th>서버</th><th class="num">인원</th></tr></thead><tbody id="servers"></tbody></table>
@@ -166,6 +167,7 @@ async function tick(){
     prev=m;prevT=now;
     document.getElementById('avg').innerHTML=m.avg_packet_size_bytes+'<small> B</small>';
     document.getElementById('total_bytes').innerHTML=fmtBytes(m.bytes_up+m.bytes_down);
+    document.getElementById('fwd').innerHTML=m.avg_forward_us+'<small> μs</small>';
     if(m.alloc_count>0){document.getElementById('alloc_card').style.display='';
       document.getElementById('alloc').innerHTML=m.alloc_count.toLocaleString()+'<small> ('+Math.round(m.alloc_bytes/1048576)+' MiB)</small>';}
     const sv=Object.entries(m.per_server).sort((a,b)=>b[1]-a[1]);

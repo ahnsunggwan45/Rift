@@ -20,6 +20,9 @@ pub struct Metrics {
     msgs_down: AtomicU64,
     transfers: AtomicU64,
     transfers_failed: AtomicU64,
+    /// down 포워드 처리시간 누적(ns)+건수 → 평균 forward latency. 핫패스 비용은 Instant 2회(~수십 ns).
+    fwd_ns_total: AtomicU64,
+    fwd_count: AtomicU64,
     /// 서버명 → 현재 인원 (plist/모니터링 기반).
     per_server: RwLock<HashMap<String, usize>>,
 }
@@ -37,6 +40,8 @@ impl Default for Metrics {
             msgs_down: AtomicU64::new(0),
             transfers: AtomicU64::new(0),
             transfers_failed: AtomicU64::new(0),
+            fwd_ns_total: AtomicU64::new(0),
+            fwd_count: AtomicU64::new(0),
             per_server: RwLock::new(HashMap::new()),
         }
     }
@@ -57,6 +62,8 @@ pub struct MetricsSnapshot {
     pub msgs_down: u64,
     /// 평균 패킷 크기(bytes) = 총 bytes / 총 msgs.
     pub avg_packet_size_bytes: u64,
+    /// 평균 down 포워드 latency(μs). 평소 수~수십 μs, 스파이크 시 다운스트림/경합 신호.
+    pub avg_forward_us: u64,
     /// 누적 할당 횟수/바이트. profiling 빌드(--features profiling)에서만 >0, 평시 0.
     pub alloc_count: u64,
     pub alloc_bytes: u64,
@@ -86,6 +93,13 @@ impl Metrics {
     pub fn on_bytes_down(&self, n: usize) {
         self.bytes_down.fetch_add(n as u64, Relaxed);
         self.msgs_down.fetch_add(1, Relaxed);
+    }
+
+    /// down 포워드 1건의 처리시간(recv→client send 완료) 기록 — 평균 forward latency 용.
+    #[inline]
+    pub fn on_forward(&self, elapsed: std::time::Duration) {
+        self.fwd_ns_total.fetch_add(elapsed.as_nanos() as u64, Relaxed);
+        self.fwd_count.fetch_add(1, Relaxed);
     }
 
     pub fn on_transfer(&self, from: &str, to: &str) {
@@ -119,6 +133,12 @@ impl Metrics {
         } else {
             0
         };
+        let fwd_count = self.fwd_count.load(Relaxed);
+        let avg_forward_us = if fwd_count > 0 {
+            self.fwd_ns_total.load(Relaxed) / fwd_count / 1000
+        } else {
+            0
+        };
         // 할당 카운터는 profiling 빌드에서만 의미값. 평시엔 0(카운팅 할당자 미사용).
         #[cfg(feature = "profiling")]
         let (alloc_count, alloc_bytes) = (
@@ -140,6 +160,7 @@ impl Metrics {
             msgs_up,
             msgs_down,
             avg_packet_size_bytes,
+            avg_forward_us,
             alloc_count,
             alloc_bytes,
             per_server: self.per_server_snapshot(),
