@@ -637,7 +637,7 @@ impl RaknetSocket {
         tokio::spawn(async move {
             loop {
                 sleep(std::time::Duration::from_millis(
-                    SendQ::DEFAULT_TIMEOUT_MILLS as u64,
+                    SendQ::TICK_INTERVAL_MILLS as u64,
                 ))
                 .await;
 
@@ -662,8 +662,9 @@ impl RaknetSocket {
                     .unwrap();
                 }
 
-                // Rift patch: flush ack (batched). All sequences received within the 50 ms
-                // window are coalesced into a single ACK — eliminates the per-datagram ACK flood.
+                // Rift patch: flush ack (batched). All sequences received within one tick window
+                // (SendQ::TICK_INTERVAL_MILLS) are coalesced into a single ACK — eliminates the
+                // per-datagram ACK flood, while a short interval keeps ping/loss-recovery responsive.
                 let acks = recvq.get_ack();
                 if !acks.is_empty() {
                     let ack = Ack {

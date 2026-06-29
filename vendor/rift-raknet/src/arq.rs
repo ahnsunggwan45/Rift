@@ -627,6 +627,13 @@ pub struct SendQ {
 impl SendQ {
     pub const DEFAULT_TIMEOUT_MILLS: i64 = 50;
 
+    /// Tick interval for ACK batching + retransmit checks (decoupled from the RTO above, so it can be
+    /// tightened without changing loss-recovery timing). Lower = more responsive ACKs/recovery and
+    /// less RTT inflation — better for high-ping/overseas players; higher = fewer tick wakeups per
+    /// connection (only matters at very large player counts). NOTE: data is NOT gated by this — new
+    /// packets flush immediately on send()/send_bytes(); this only governs ACK/NACK/retransmit timing.
+    pub const TICK_INTERVAL_MILLS: i64 = 20;
+
     const RTO_UBOUND: i64 = 12000;
     const RTO_LBOUND: i64 = 50;
 
