@@ -387,7 +387,9 @@ async fn send_pkt(sock: &RaknetSocket, pkt: &[u8]) -> Result<()> {
 }
 
 /// How long to wait for the client's dimension-change ack before proceeding anyway (fallback).
-const DIM_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+/// Kept short so a missed ack only adds a small delay; once detection works the ack arrives well
+/// within this and the wait returns immediately.
+const DIM_ACK_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// Waits for the client to confirm a dimension change (PlayerAction DIMENSION_CHANGE_ACK), draining
 /// and discarding other client packets meanwhile. Returns on the ack or after `timeout` — the
@@ -420,16 +422,28 @@ fn client_msg_is_dim_change_ack(msg: &[u8], compression_on: bool) -> bool {
     } else {
         (crate::compression::NONE, payload)
     };
-    let Ok(batch) = crate::compression::decompress(comp_type, batch_data) else {
-        return false;
+    let batch = match crate::compression::decompress(comp_type, batch_data) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::debug!(comp_type, "transfer wait: client batch decode failed: {e}");
+            return false;
+        }
     };
     let Ok(pkts) = crate::framing::split_batch(&batch) else {
         return false;
     };
-    pkts.iter().any(|p| {
-        crate::framing::peek_packet_id(p).ok() == Some(packets::ID_PLAYER_ACTION)
-            && packets::parse_player_action(p) == Some(packets::PLAYER_ACTION_DIMENSION_CHANGE_DONE)
-    })
+    let mut acked = false;
+    for p in &pkts {
+        if crate::framing::peek_packet_id(p).ok() == Some(packets::ID_PLAYER_ACTION) {
+            // DIAGNOSTIC: log the action so we can see what the client actually sends on a dim change.
+            let action = packets::parse_player_action(p);
+            tracing::info!(?action, "transfer wait: client PlayerAction");
+            if action == Some(packets::PLAYER_ACTION_DIMENSION_CHANGE_DONE) {
+                acked = true;
+            }
+        }
+    }
+    acked
 }
 
 /// Performs a transparent channel transfer (connect-before-disconnect). Ported from the Spectrum verification sequence.
