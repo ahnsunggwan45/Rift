@@ -13,7 +13,7 @@ sub = "powered by Rift"
 players = 0
 max_players = 500
 protocol = 1001                # 클라 프로토콜 번호 (안 맞아도 보통 접속은 됨)
-version = "1.21.0"             # 표시용 버전 문자열
+version = "1.26.30"            # 표시용 버전 문자열 (클라 버전에 맞게)
 gametype = "Survival"
 
 [features]

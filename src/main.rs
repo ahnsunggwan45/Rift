@@ -108,7 +108,7 @@ async fn run(cfg: Arc<Config>) -> Result<()> {
                 other => {
                     tracing::warn!("다운스트림 MOTD 조회 실패/타임아웃({other:?}) — 기본 MOTD 사용");
                     listener
-                        .set_motd("Rift", 1000, "1.21.0", "1.21.0", "Survival", listen_addr.port())
+                        .set_motd("Rift", 1001, "1.26.30", "1.26.30", "Survival", listen_addr.port())
                         .await;
                 }
             }
