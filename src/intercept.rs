@@ -34,8 +34,8 @@ const RP_STATUS_COMPLETED: u8 = 4;
 /// 관심 패킷 ID bitmap(10비트 ID 공간). 핫패스에서 배열 1회 조회로 대다수 패킷을 즉시 통과시킨다
 /// (분기예측 친화 — match 의 순차 비교보다 비관심 패킷에서 유리). 관심 ID 만 true 인 superset이고,
 /// 동적 게이팅(watching_vv/channel_transfer/rp)은 match 가드가 담당한다.
-const fn interest(ids: &[u32]) -> [bool; 1024] {
-    let mut t = [false; 1024];
+const fn interest(ids: &[u32]) -> [bool; 256] {
+    let mut t = [false; 256];
     let mut i = 0;
     while i < ids.len() {
         t[ids[i] as usize] = true;
@@ -45,7 +45,7 @@ const fn interest(ids: &[u32]) -> [bool; 1024] {
 }
 
 /// down(서버→클라)에서 우리가 손대는 패킷 ID 전체.
-const DOWN_INTEREST: [bool; 1024] = interest(&[
+const DOWN_INTEREST: [bool; 256] = interest(&[
     ID_NETWORK_SETTINGS,
     ID_RESOURCE_PACKS_INFO,
     ID_RESOURCE_PACK_STACK,
@@ -329,7 +329,9 @@ fn try_intercept(
     for (i, p) in packets.iter().enumerate() {
         let Ok(id) = peek_packet_id(p) else { continue };
         // 핫패스 fast-reject: 관심 ID bitmap 1회 조회로 대다수(이동/엔티티 등) 패킷을 즉시 통과.
-        if !DOWN_INTEREST[id as usize] {
+        // 관심 패킷 ID 는 전부 <256. 범위 밖(256+) ID 는 우리가 안 건드리므로 바운드체크로 통과(panic 방지).
+        let idx = id as usize;
+        if idx >= DOWN_INTEREST.len() || !DOWN_INTEREST[idx] {
             continue;
         }
         match id {

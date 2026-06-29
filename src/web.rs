@@ -132,6 +132,9 @@ tr:last-child td{border-bottom:none}.num{text-align:right}.mut{color:var(--mut)}
     <div class="card"><div class="k">채널이동</div><div class="v" id="tx">–</div></div>
     <div class="card"><div class="k">업로드</div><div class="v" id="up_r">–<small> KiB/s</small></div></div>
     <div class="card"><div class="k">다운로드</div><div class="v" id="dn_r">–<small> KiB/s</small></div></div>
+    <div class="card"><div class="k">패킷/초</div><div class="v" id="pps">–</div></div>
+    <div class="card"><div class="k">평균 패킷</div><div class="v" id="avg">–<small> B</small></div></div>
+    <div class="card" id="alloc_card" style="display:none"><div class="k">할당(누적)</div><div class="v" id="alloc">–</div></div>
   </div>
   <h2>서버별 인원</h2>
   <table><thead><tr><th>서버</th><th class="num">인원</th></tr></thead><tbody id="servers"></tbody></table>
@@ -153,8 +156,12 @@ async function tick(){
     document.getElementById('up').textContent='가동 '+fmtUp(m.uptime_secs);
     if(prev){const dt=(now-prevT)/1000||1;
       document.getElementById('up_r').innerHTML=Math.max(0,Math.round((m.bytes_up-prev.bytes_up)/1024/dt))+'<small> KiB/s</small>';
-      document.getElementById('dn_r').innerHTML=Math.max(0,Math.round((m.bytes_down-prev.bytes_down)/1024/dt))+'<small> KiB/s</small>';}
+      document.getElementById('dn_r').innerHTML=Math.max(0,Math.round((m.bytes_down-prev.bytes_down)/1024/dt))+'<small> KiB/s</small>';
+      document.getElementById('pps').textContent=Math.max(0,Math.round(((m.msgs_up+m.msgs_down)-(prev.msgs_up+prev.msgs_down))/dt));}
     prev=m;prevT=now;
+    document.getElementById('avg').innerHTML=m.avg_packet_size_bytes+'<small> B</small>';
+    if(m.alloc_count>0){document.getElementById('alloc_card').style.display='';
+      document.getElementById('alloc').innerHTML=m.alloc_count.toLocaleString()+'<small> ('+Math.round(m.alloc_bytes/1048576)+' MiB)</small>';}
     const sv=Object.entries(m.per_server).sort((a,b)=>b[1]-a[1]);
     document.getElementById('servers').innerHTML=sv.length?sv.map(([k,v])=>`<tr><td>${k}</td><td class="num">${v}</td></tr>`).join(''):'<tr><td colspan=2 class="mut">없음</td></tr>';
     document.getElementById('players').innerHTML=p.length?p.map(x=>`<tr><td>${x.name||'<span class=mut>?</span>'}</td><td class="mut">${x.peer}</td><td><span class="pill">${x.server}</span></td></tr>`).join(''):'<tr><td colspan=3 class="mut">없음</td></tr>';

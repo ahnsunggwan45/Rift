@@ -6,6 +6,17 @@ Rift sits in front of your [PocketMine-MP](https://github.com/pmmp/PocketMine-MP
 
 > **Status:** actively developed. Core proxying and seamless transfer are verified in-game. See [Status](#status) for what's battle-tested vs. experimental.
 
+## Goals
+
+Rift optimizes for a few **measurable** targets (observe them at [`/metrics`](#web-monitoring)):
+
+- **Zero hot-path allocation** — forwarding a packet allocates nothing on the heap (verify with a `--features profiling` build → `alloc_count`).
+- **No work for uninteresting packets** — packets Rift doesn't touch are never decoded into objects; they pass through as raw bytes.
+- **Minimal forward latency** and **0% drop** for reliable traffic.
+- **Lower CPU than WaterdogPE** at equivalent load.
+
+> **On "zero-copy":** Rift is **application-level zero-copy** — a *copy-minimized data path*. Within the process, forwarded bytes are moved (ref-counted), not copied. The unavoidable NIC → kernel → userspace copy still happens; true kernel-bypass zero-copy (io_uring registered buffers) is on the roadmap.
+
 ## Features
 
 - **Seamless server switching** — players move between downstream servers with only a brief loading screen (dimension-flip technique, inspired by [Spectrum](https://github.com/cooldogedev/spectrum)). Game mode, game rules, boss bars and scoreboards are carried over.
@@ -38,6 +49,15 @@ Rift terminates RakNet itself: clients connect to Rift, and Rift opens its own R
 4. The client returns to the overworld and the buffered spawn stream is replayed.
 
 Entity IDs are **not** rewritten. Instead, every server assigns the same player the same runtime ID — `crc32(XUID) & 0x7FFFFFFFFFFFFFFF` — so the client's view stays consistent across servers (see [Requirements](#requirements)).
+
+## Design principles
+
+Deliberate choices, worth preserving:
+
+- **Byte-stream proxy** — decode only the few packets Rift must act on; forward everything else as raw bytes (no object creation on the hot path).
+- **Vendored, patched RakNet** ([`vendor/rift-raknet`](vendor/rift-raknet)) — Rift owns its RakNet layer, so the data path is tuned directly: copy-minimized framing, bounded fragment reassembly (DoS-resistant), reliable-packet de-duplication.
+- **Packet fast-path** — a small interest bitmap rejects uninteresting packet IDs in a single lookup.
+- **Measure, then optimize** — metrics come first. Bolt-on optimizations (packet pooling, worker-sharding, io_uring) are applied only after real-server measurement shows they help.
 
 ## Requirements
 
@@ -149,9 +169,9 @@ Rift targets the Bedrock protocol used by current PocketMine-MP builds. The spec
 ## Status
 
 - ✅ Connect + seamless transfer (chunks, players, game mode, game rules, state teardown) — verified in-game.
-- ✅ Zero-copy data path, panic-free parsing, fragment + reliable-packet hardening — unit & integration tested.
+- ✅ Copy-minimized data path (application-level zero-copy), panic-free parsing, fragment + reliable-packet hardening — unit & integration tested.
 - ⚠️ Resource-pack serving — implemented, not yet verified in-game (disabled by default).
-- 🔭 Roadmap: deeper Linux performance (sendmmsg/recvmmsg, io_uring, NUMA), packet pooling — pending real-server measurement.
+- 🔭 Roadmap (pending real-server measurement): per-worker `SO_REUSEPORT` sockets (one UDP socket per core → no shared-socket contention), `sendmmsg`/`recvmmsg`, io_uring, NUMA pinning, packet pooling, and richer metrics (per-operation latency, per-core throughput, worker imbalance).
 
 ## License
 

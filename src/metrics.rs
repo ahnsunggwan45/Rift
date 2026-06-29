@@ -52,6 +52,11 @@ pub struct MetricsSnapshot {
     pub bytes_down: u64,
     pub msgs_up: u64,
     pub msgs_down: u64,
+    /// 평균 패킷 크기(bytes) = 총 bytes / 총 msgs.
+    pub avg_packet_size_bytes: u64,
+    /// 누적 할당 횟수/바이트. profiling 빌드(--features profiling)에서만 >0, 평시 0.
+    pub alloc_count: u64,
+    pub alloc_bytes: u64,
     pub per_server: HashMap<String, usize>,
 }
 
@@ -100,16 +105,38 @@ impl Metrics {
 
     /// 전체 메트릭 스냅샷 (웹 /metrics, 콘솔 info 용).
     pub fn snapshot(&self) -> MetricsSnapshot {
+        let bytes_up = self.bytes_up.load(Relaxed);
+        let bytes_down = self.bytes_down.load(Relaxed);
+        let msgs_up = self.msgs_up.load(Relaxed);
+        let msgs_down = self.msgs_down.load(Relaxed);
+        let total_msgs = msgs_up + msgs_down;
+        let avg_packet_size_bytes = if total_msgs > 0 {
+            (bytes_up + bytes_down) / total_msgs
+        } else {
+            0
+        };
+        // 할당 카운터는 profiling 빌드에서만 의미값. 평시엔 0(카운팅 할당자 미사용).
+        #[cfg(feature = "profiling")]
+        let (alloc_count, alloc_bytes) = (
+            crate::profiling::ALLOC_COUNT.load(Relaxed),
+            crate::profiling::ALLOC_BYTES.load(Relaxed),
+        );
+        #[cfg(not(feature = "profiling"))]
+        let (alloc_count, alloc_bytes) = (0u64, 0u64);
+
         MetricsSnapshot {
             uptime_secs: self.start_time.elapsed().as_secs(),
             active: self.active.load(Relaxed),
             connections_total: self.connections_total.load(Relaxed),
             transfers: self.transfers.load(Relaxed),
             transfers_failed: self.transfers_failed.load(Relaxed),
-            bytes_up: self.bytes_up.load(Relaxed),
-            bytes_down: self.bytes_down.load(Relaxed),
-            msgs_up: self.msgs_up.load(Relaxed),
-            msgs_down: self.msgs_down.load(Relaxed),
+            bytes_up,
+            bytes_down,
+            msgs_up,
+            msgs_down,
+            avg_packet_size_bytes,
+            alloc_count,
+            alloc_bytes,
             per_server: self.per_server_snapshot(),
         }
     }

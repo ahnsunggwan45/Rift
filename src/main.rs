@@ -10,11 +10,19 @@
 //! Phase 0 과 동일하게 "동작하는 연결"이 나온다. 핵심 차이는 RakNet 종단을
 //! 우리가 쥐었다는 것 — 이게 Phase 1b(암호화 종단·패킷 가로채기)의 전제다.
 
-// 전역 할당자: mimalloc (docs/performance.md #12). 매 패킷·세션 할당이 잦은 프록시에 유리.
+// 전역 할당자: mimalloc (매 패킷·세션 할당이 잦은 프록시에 유리).
 // optional feature — musl 정적 빌드(--no-default-features)에선 빠지고 system 할당자 사용.
-#[cfg(feature = "mimalloc")]
+// profiling 빌드(--features profiling)에선 카운팅 할당자가 우선해 alloc 횟수/바이트를 측정한다.
+#[cfg(all(feature = "mimalloc", not(feature = "profiling")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+// 측정 전용 카운팅 할당자. "Hot Path Allocation = 0" 목표를 /metrics 의 alloc_count 로 검증.
+#[cfg(feature = "profiling")]
+mod profiling;
+#[cfg(feature = "profiling")]
+#[global_allocator]
+static GLOBAL_PROF: profiling::CountingAllocator = profiling::CountingAllocator;
 
 mod compression;
 mod config;

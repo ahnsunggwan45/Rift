@@ -41,9 +41,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 기본: mimalloc 전역 할당자 사용. musl 정적 빌드 시 --no-default-features 로 끄면
 # C 의존성이 사라져 musl-gcc 없이 순수 Rust 정적 링크가 된다(할당자는 system).
 default = ["mimalloc"]
+# 측정 빌드: 카운팅 할당자로 alloc 횟수/바이트를 /metrics 에 노출(Hot Path Allocation=0 검증).
+# 프로덕션은 끔 — 오버헤드 0. 예: cargo build --release --features profiling
+profiling = []
 
 [profile.release]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+strip = true        # 디버그 심볼 제거 → 릴리스 바이너리 크기 감소
