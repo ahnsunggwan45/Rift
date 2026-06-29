@@ -46,9 +46,9 @@ Rift terminates RakNet itself: clients connect to Rift, and Rift opens its own R
 **Seamless transfer** (triggered by a downstream `TransferPacket`, or the console `transfer` command):
 
 1. Rift connects to the target server and drives the handshake to full spawn, buffering the spawn stream.
-2. The client is flipped to a dummy dimension (clearing the old world) and filled with empty chunks.
-3. The downstream connection is swapped; `SetLocalPlayerAsInitialized` triggers the real spawn.
-4. The client returns to the overworld and the buffered spawn stream is replayed.
+2. The previous server's client-side state is torn down: actor entities (`RemoveActor`), boss bars, scoreboards, and weather — so nothing lingers as a ghost.
+3. The client is walked through a dimension flip (to a dummy dimension and back). Each change is sent the way the client needs to actually *complete* it — `ChangeDimension` → `NetworkChunkPublisherUpdate` → chunks → `PlayStatus` → dimension-change ACK — which fully re-initializes it on the new world (this mirrors WaterdogPE's sequence).
+4. The downstream connection is swapped, `SetLocalPlayerAsInitialized` triggers the real spawn, and the buffered spawn stream is replayed.
 
 Entity IDs are **not** rewritten. Instead, every server assigns the same player the same runtime ID — `crc32(XUID) & 0x7FFFFFFFFFFFFFFF` — so the client's view stays consistent across servers (see [Requirements](#requirements)).
 
@@ -191,7 +191,7 @@ Rift targets the Bedrock protocol used by current PocketMine-MP builds. The spec
 
 **Core**
 - ✅ RakNet transport · login · resource-pack phase
-- ✅ Seamless server transfer — StartGame interception, state teardown (verified in-game)
+- ✅ Seamless server transfer — WaterdogPE-style dimension-flip + chunk-publisher/ACK completion, state teardown (entities, boss bars, scoreboards, weather), verified in-game
 - ✅ Metrics endpoint · web dashboard · live console
 - ⬜ Client-side encryption termination (see [Security](#security--trust-model))
 - ⬜ Config hot-reload
