@@ -14,7 +14,17 @@ pub struct Identity {
 
 /// Login 게임패킷 바이트(VarInt 패킷헤더로 시작)에서 이름/XUID 를 뽑는다. 실패는 전부 None.
 pub fn extract(login_pkt: &[u8]) -> Identity {
-    parse(login_pkt).unwrap_or_default()
+    let id = parse(login_pkt).unwrap_or_default();
+    if id.name.is_none() {
+        // 이름 추출 실패 — Bedrock 버전마다 Login/chain 포맷이 다를 수 있다. 포맷 파악용으로
+        // 로그인 앞부분(헤더·길이 등 바이너리는 '.')을 1회 로깅한다(세션당 1회만 호출됨).
+        let head: String = String::from_utf8_lossy(&login_pkt[..login_pkt.len().min(96)])
+            .chars()
+            .map(|c| if c.is_control() { '.' } else { c })
+            .collect();
+        tracing::warn!(len = login_pkt.len(), head = %head, "login: displayName 추출 실패 — 앞 96B(포맷 진단)");
+    }
+    id
 }
 
 fn parse(pkt: &[u8]) -> Option<Identity> {
@@ -60,11 +70,7 @@ fn parse(pkt: &[u8]) -> Option<Identity> {
         }
     }
 
-    // 이름 추출 실패 — Bedrock 버전마다 chain 포맷이 달라서일 수 있다. 포맷 파악용 1회 진단 로깅.
-    if let Some(obj) = v.as_object() {
-        let keys: Vec<&str> = obj.keys().map(String::as_str).collect();
-        tracing::warn!(?keys, jwt_count = jwts.len(), "login: displayName 추출 실패 — chain 포맷 확인 요망");
-    }
+    // 이름 못 찾음 — xuid 만이라도 있으면 반환(진단 로깅은 호출부 extract 에서 일괄 처리).
     xuid_only.map(|xuid| Identity { name: None, xuid: Some(xuid) })
 }
 

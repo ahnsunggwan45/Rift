@@ -13,6 +13,7 @@ pub struct Metrics {
     start_time: Instant,
     connections_total: AtomicU64,
     active: AtomicUsize,
+    peak_active: AtomicUsize,
     bytes_up: AtomicU64,
     bytes_down: AtomicU64,
     msgs_up: AtomicU64,
@@ -29,6 +30,7 @@ impl Default for Metrics {
             start_time: Instant::now(),
             connections_total: AtomicU64::new(0),
             active: AtomicUsize::new(0),
+            peak_active: AtomicUsize::new(0),
             bytes_up: AtomicU64::new(0),
             bytes_down: AtomicU64::new(0),
             msgs_up: AtomicU64::new(0),
@@ -45,6 +47,7 @@ impl Default for Metrics {
 pub struct MetricsSnapshot {
     pub uptime_secs: u64,
     pub active: usize,
+    pub peak_active: usize,
     pub connections_total: u64,
     pub transfers: u64,
     pub transfers_failed: u64,
@@ -63,7 +66,8 @@ pub struct MetricsSnapshot {
 impl Metrics {
     pub fn on_connect(&self, server: &str) {
         self.connections_total.fetch_add(1, Relaxed);
-        self.active.fetch_add(1, Relaxed);
+        let now_active = self.active.fetch_add(1, Relaxed) + 1;
+        self.peak_active.fetch_max(now_active, Relaxed); // 최대 동시접속 high-water
         self.inc_server(server);
     }
 
@@ -127,6 +131,7 @@ impl Metrics {
         MetricsSnapshot {
             uptime_secs: self.start_time.elapsed().as_secs(),
             active: self.active.load(Relaxed),
+            peak_active: self.peak_active.load(Relaxed),
             connections_total: self.connections_total.load(Relaxed),
             transfers: self.transfers.load(Relaxed),
             transfers_failed: self.transfers_failed.load(Relaxed),

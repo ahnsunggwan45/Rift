@@ -135,23 +135,28 @@ tr:last-child td{border-bottom:none}.num{text-align:right}.mut{color:var(--mut)}
     <div class="card"><div class="k">패킷/초</div><div class="v" id="pps">–</div></div>
     <div class="card"><div class="k">평균 패킷</div><div class="v" id="avg">–<small> B</small></div></div>
     <div class="card" id="alloc_card" style="display:none"><div class="k">할당(누적)</div><div class="v" id="alloc">–</div></div>
+    <div class="card"><div class="k">최대 동시</div><div class="v" id="peak">–</div></div>
+    <div class="card"><div class="k">누적 송수신</div><div class="v" id="total_bytes">–</div></div>
   </div>
   <h2>서버별 인원</h2>
   <table><thead><tr><th>서버</th><th class="num">인원</th></tr></thead><tbody id="servers"></tbody></table>
   <h2>접속자</h2>
-  <table><thead><tr><th>이름</th><th>IP</th><th>서버</th></tr></thead><tbody id="players"></tbody></table>
+  <table><thead><tr><th>이름</th><th>IP</th><th>서버</th><th class="num">접속</th></tr></thead><tbody id="players"></tbody></table>
   <p class="mut" id="err"></p>
 </div>
 <script>
 let prev=null,prevT=0;
 function fmtUp(s){const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
   return (d?d+"d ":"")+(h?h+"h ":"")+m+"m";}
+function fmtBytes(b){const u=['B','KiB','MiB','GiB','TiB'];let i=0;while(b>=1024&&i<u.length-1){b/=1024;i++;}return b.toFixed(i?1:0)+' '+u[i];}
+function fmtDur(s){if(s<60)return s+'s';const m=Math.floor(s/60);if(m<60)return m+'m';return Math.floor(m/60)+'h '+(m%60)+'m';}
 async function tick(){
   try{
     const [m,p]=await Promise.all([fetch('/metrics').then(r=>r.json()),fetch('/players').then(r=>r.json())]);
     const now=Date.now();
     document.getElementById('active').textContent=m.active;
     document.getElementById('total').textContent=m.connections_total;
+    document.getElementById('peak').textContent=m.peak_active;
     document.getElementById('tx').textContent=m.transfers+(m.transfers_failed?` (실패 ${m.transfers_failed})`:'');
     document.getElementById('up').textContent='가동 '+fmtUp(m.uptime_secs);
     if(prev){const dt=(now-prevT)/1000||1;
@@ -160,11 +165,12 @@ async function tick(){
       document.getElementById('pps').textContent=Math.max(0,Math.round(((m.msgs_up+m.msgs_down)-(prev.msgs_up+prev.msgs_down))/dt));}
     prev=m;prevT=now;
     document.getElementById('avg').innerHTML=m.avg_packet_size_bytes+'<small> B</small>';
+    document.getElementById('total_bytes').innerHTML=fmtBytes(m.bytes_up+m.bytes_down);
     if(m.alloc_count>0){document.getElementById('alloc_card').style.display='';
       document.getElementById('alloc').innerHTML=m.alloc_count.toLocaleString()+'<small> ('+Math.round(m.alloc_bytes/1048576)+' MiB)</small>';}
     const sv=Object.entries(m.per_server).sort((a,b)=>b[1]-a[1]);
     document.getElementById('servers').innerHTML=sv.length?sv.map(([k,v])=>`<tr><td>${k}</td><td class="num">${v}</td></tr>`).join(''):'<tr><td colspan=2 class="mut">없음</td></tr>';
-    document.getElementById('players').innerHTML=p.length?p.map(x=>`<tr><td>${x.name||'<span class=mut>?</span>'}</td><td class="mut">${x.peer}</td><td><span class="pill">${x.server}</span></td></tr>`).join(''):'<tr><td colspan=3 class="mut">없음</td></tr>';
+    document.getElementById('players').innerHTML=p.length?p.map(x=>`<tr><td>${x.name||'<span class=mut>?</span>'}</td><td class="mut">${x.peer}</td><td><span class="pill">${x.server}</span></td><td class="num mut">${fmtDur(x.connected_secs)}</td></tr>`).join(''):'<tr><td colspan=4 class="mut">없음</td></tr>';
     document.getElementById('err').textContent='';
   }catch(e){document.getElementById('err').textContent='연결 끊김 — 재시도 중…';}
 }

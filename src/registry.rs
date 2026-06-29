@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::RwLock;
+use std::time::Instant;
 
 use tokio::sync::mpsc;
 
@@ -27,6 +28,7 @@ struct Entry {
     peer: SocketAddr,
     server: String,
     control: mpsc::Sender<Control>,
+    connected: Instant,
 }
 
 /// 웹 `/players` · 콘솔 `list` 직렬화용 세션 요약.
@@ -36,6 +38,8 @@ pub struct SessionInfo {
     pub name: Option<String>,
     pub peer: String,
     pub server: String,
+    /// 접속 후 경과 시간(초).
+    pub connected_secs: u64,
 }
 
 #[derive(Default)]
@@ -49,7 +53,7 @@ impl Registry {
     pub fn register(&self, peer: SocketAddr, server: String, control: mpsc::Sender<Control>) -> u64 {
         let id = self.next_id.fetch_add(1, Relaxed);
         if let Ok(mut s) = self.sessions.write() {
-            s.insert(id, Entry { name: None, xuid: None, peer, server, control });
+            s.insert(id, Entry { name: None, xuid: None, peer, server, control, connected: Instant::now() });
         }
         id
     }
@@ -95,6 +99,7 @@ impl Registry {
                         name: e.name.clone(),
                         peer: e.peer.to_string(),
                         server: e.server.clone(),
+                        connected_secs: e.connected.elapsed().as_secs(),
                     })
                     .collect()
             })
