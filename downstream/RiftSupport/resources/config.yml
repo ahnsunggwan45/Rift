@@ -1,0 +1,11 @@
+# RiftSupport configuration.
+#
+# Out-of-band control channel — must match the proxy's [control] section. Leave `host` empty to disable
+# it (deterministic entity ids still work; the proxy's lazy_decode transfers do not). When enabled, call
+#   Rift\Main::transfer($player, $channelName)
+# instead of $player->transfer(), and turn on `lazy_decode` in the proxy config. The proxy then never has
+# to scan the game stream for TransferPackets, so the steady-state down stream stays a pure pass-through.
+control:
+  host: ""      # e.g. "127.0.0.1" — the proxy host (usually localhost; proxy and backend are co-located)
+  port: 0       # e.g. 8090 — the port of the proxy's [control] addr
+  token: ""     # must exactly equal the proxy's [control] token

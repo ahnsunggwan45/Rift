@@ -72,8 +72,9 @@ Each **downstream PMMP server** behind Rift needs two things:
 
 Drop the [`downstream/RiftSupport`](downstream/RiftSupport) plugin into each backend server. It:
 
-- swaps in a `Player` that sets a deterministic id (`crc32(XUID)`), and
-- warns you on startup if encryption is still on, or if a custom `Player` class needs the manual step below.
+- swaps in a `Player` that sets a deterministic id (`crc32(XUID)`),
+- warns you on startup if encryption is still on, or if a custom `Player` class needs the manual step below, and
+- (optional) exposes `Rift\Main::transfer($player, $channel)` — an out-of-band transfer trigger for `lazy_decode` mode (see [Out-of-band control](#out-of-band-control)).
 
 Load it as a folder with [DevTools](https://github.com/pmmp/DevTools), or build a `.phar`.
 
