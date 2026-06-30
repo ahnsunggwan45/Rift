@@ -8,8 +8,8 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use tokio::sync::mpsc;
@@ -22,6 +22,60 @@ pub enum Control {
     Kick,
 }
 
+/// Relay stages — what a session's relay loop is currently doing. Read by the stall watchdog so a hang
+/// can be pinned to a specific operation (e.g. `intercept_down` covers downstream decompression/decoding).
+pub mod stage {
+    pub const IDLE: u8 = 0; // waiting in select! for I/O (normal)
+    pub const INTERCEPT_UP: u8 = 1; // handling a client→server message
+    pub const SEND_SERVER: u8 = 2; // forwarding to the downstream
+    pub const INTERCEPT_DOWN: u8 = 3; // handling a server→client message (decompress lives here)
+    pub const SEND_CLIENT: u8 = 4; // forwarding to the client
+    pub const RTT: u8 = 5; // measuring client RTT
+    pub const TRANSFER: u8 = 6; // performing a seamless transfer
+
+    pub fn name(s: u8) -> &'static str {
+        match s {
+            INTERCEPT_UP => "intercept_up",
+            SEND_SERVER => "send_server",
+            INTERCEPT_DOWN => "intercept_down",
+            SEND_CLIENT => "send_client",
+            RTT => "rtt",
+            TRANSFER => "transfer",
+            _ => "idle",
+        }
+    }
+}
+
+/// Per-session liveness for the stall watchdog. Relaxed atomics — a couple of cheap stores per packet.
+#[derive(Default)]
+pub struct Health {
+    /// Current relay stage (see [`stage`]).
+    pub stage: AtomicU8,
+    /// Incremented once per relay loop iteration — proves the loop is still progressing.
+    pub loop_beat: AtomicU64,
+}
+
+impl Health {
+    /// Mark the current relay stage (cheap relaxed store).
+    #[inline]
+    pub fn set_stage(&self, s: u8) {
+        self.stage.store(s, Relaxed);
+    }
+    /// Record one loop iteration of progress.
+    #[inline]
+    pub fn beat(&self) {
+        self.loop_beat.fetch_add(1, Relaxed);
+    }
+}
+
+/// Snapshot of one session's health for a watchdog scan.
+pub struct HealthSnap {
+    pub id: u64,
+    pub name: Option<String>,
+    pub stage: u8,
+    pub loop_beat: u64,
+}
+
 /// Registry entry for a single session.
 struct Entry {
     name: Option<String>,
@@ -32,6 +86,7 @@ struct Entry {
     control: mpsc::Sender<Control>,
     connected: Instant,
     rtt_ms: u32,
+    health: Arc<Health>,
 }
 
 /// Session summary serialized for `GET /players` and the console `list` command.
@@ -55,12 +110,29 @@ pub struct Registry {
 
 impl Registry {
     /// Register a new session. Use the returned id for subsequent set_identity/set_server/remove calls.
-    pub fn register(&self, peer: SocketAddr, server: String, control: mpsc::Sender<Control>) -> u64 {
+    pub fn register(&self, peer: SocketAddr, server: String, control: mpsc::Sender<Control>, health: Arc<Health>) -> u64 {
         let id = self.next_id.fetch_add(1, Relaxed);
         if let Ok(mut s) = self.sessions.write() {
-            s.insert(id, Entry { name: None, xuid: None, peer, server, control, connected: Instant::now(), rtt_ms: 0 });
+            s.insert(id, Entry { name: None, xuid: None, peer, server, control, connected: Instant::now(), rtt_ms: 0, health });
         }
         id
+    }
+
+    /// Snapshot of per-session health (current stage + loop heartbeat) for the stall watchdog.
+    pub fn health_snapshot(&self) -> Vec<HealthSnap> {
+        self.sessions
+            .read()
+            .map(|s| {
+                s.iter()
+                    .map(|(id, e)| HealthSnap {
+                        id: *id,
+                        name: e.name.clone(),
+                        stage: e.health.stage.load(Relaxed),
+                        loop_beat: e.health.loop_beat.load(Relaxed),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Populate the session with name/XUID extracted from the login packet (only non-None values are applied).

@@ -170,6 +170,47 @@ async fn run(cfg: Arc<Config>) -> Result<()> {
     // Console commands (stdin). Exits silently on EOF when running in the background.
     console::spawn(registry.clone(), metrics.clone(), shutdown.clone());
 
+    // Stall watchdog: logs any session whose relay loop stops progressing (a proxy-side hang), with the
+    // stage it was stuck in — so an in-the-wild freeze is localized (stage=intercept_down ⇒ decompression,
+    // send_client ⇒ RakNet send window, idle ⇒ no inbound packets). Silent unless a stall occurs.
+    {
+        let reg = registry.clone();
+        tokio::spawn(async move {
+            use std::collections::{HashMap, HashSet};
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            tick.tick().await; // consume the immediate first tick
+            let mut last_beat: HashMap<u64, u64> = HashMap::new();
+            let mut frozen_scans: HashMap<u64, u32> = HashMap::new();
+            let mut reported: HashSet<u64> = HashSet::new();
+            loop {
+                tick.tick().await;
+                let snap = reg.health_snapshot();
+                let live: HashSet<u64> = snap.iter().map(|h| h.id).collect();
+                last_beat.retain(|k, _| live.contains(k));
+                frozen_scans.retain(|k, _| live.contains(k));
+                reported.retain(|k| live.contains(k));
+                for h in &snap {
+                    if last_beat.insert(h.id, h.loop_beat) == Some(h.loop_beat) {
+                        let c = frozen_scans.entry(h.id).or_insert(0);
+                        *c += 1;
+                        // 3 consecutive unchanged 5s scans ≈ 15s with no loop progress → stalled.
+                        if *c >= 3 && reported.insert(h.id) {
+                            tracing::error!(
+                                session = h.id,
+                                name = ?h.name,
+                                stage = registry::stage::name(h.stage),
+                                "RELAY STALL: loop has not progressed for ~15s (proxy-side hang)"
+                            );
+                        }
+                    } else {
+                        frozen_scans.insert(h.id, 0);
+                        reported.remove(&h.id);
+                    }
+                }
+            }
+        });
+    }
+
     listener.listen().await;
     tracing::info!(
         %listen_addr,
@@ -252,15 +293,21 @@ async fn relay(
         .peer_addr()
         .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
     let (ctl_tx, mut ctl_rx) = tokio::sync::mpsc::channel::<registry::Control>(8);
-    let session_id = registry.register(peer, current_server.clone(), ctl_tx);
+    // Per-session health for the stall watchdog (records the current stage + a loop heartbeat).
+    let health = std::sync::Arc::new(registry::Health::default());
+    let session_id = registry.register(peer, current_server.clone(), ctl_tx, health.clone());
     let mut identity_set = false;
     // Periodically update the client↔proxy RTT (ping) in the registry for web/console display.
     let mut rtt_tick = tokio::time::interval(std::time::Duration::from_secs(3));
 
     loop {
         let mut transfer_to: Option<String> = None;
+        // Watchdog heartbeat: one beat per loop iteration; stage resets to idle while waiting in select.
+        health.beat();
+        health.set_stage(registry::stage::IDLE);
         tokio::select! {
             _ = rtt_tick.tick() => {
+                health.set_stage(registry::stage::RTT);
                 let rtt = client.rtt().await;
                 registry.set_rtt(session_id, rtt.max(0) as u32);
             }
@@ -277,10 +324,12 @@ async fn relay(
             },
             up = client.recv() => match up {
                 Ok(data) => {
+                    health.set_stage(registry::stage::INTERCEPT_UP);
                     metrics.on_bytes_up(data.len());
                     match intercept::intercept_up(&mut state, &data, packs.as_deref()) {
                         Outcome::Forward => {
                             // zero-copy: forward the received Bytes to downstream without copying.
+                            health.set_stage(registry::stage::SEND_SERVER);
                             if server.send_bytes(data, Reliability::ReliableOrdered).await.is_err() {
                                 break;
                             }
@@ -302,11 +351,13 @@ async fn relay(
             },
             down = server.recv() => match down {
                 Ok(data) => {
+                    health.set_stage(registry::stage::INTERCEPT_DOWN);
                     let fwd_t0 = std::time::Instant::now();
                     metrics.on_bytes_down(data.len());
                     match intercept::intercept_down(&mut state, &data, force_vv, channel_transfer, max_decode, packs.as_deref()) {
                         Outcome::Forward => {
                             // zero-copy: forward the received Bytes to the client without copying.
+                            health.set_stage(registry::stage::SEND_CLIENT);
                             if client.send_bytes(data, Reliability::ReliableOrdered).await.is_err() {
                                 break;
                             }
@@ -345,6 +396,7 @@ async fn relay(
         }
 
         if let Some(target) = transfer_to {
+            health.set_stage(registry::stage::TRANSFER);
             match do_transfer(&cfg, &mut state, &target, version, &client, &mut server).await {
                 Ok(true) => {
                     tracing::info!(%target, "transfer complete");
