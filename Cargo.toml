@@ -44,10 +44,15 @@ default = ["mimalloc"]
 # Instrumented build: exposes alloc count/bytes via /metrics using a counting allocator (verifies Hot Path Allocation=0).
 # Disabled in production — zero overhead. Example: cargo build --release --features profiling
 profiling = []
+# Faster DEFLATE decompression via zlib-ng (C) instead of the default pure-Rust miniz_oxide backend —
+# ~1.5-2x faster inflate, which is the dominant cost of decoding the down stream. Like mimalloc it is a
+# C dependency (needs a C toolchain + cmake) and is incompatible with the pure-Rust musl static build, so
+# it is opt-in for the glibc production binary:  cargo build --release --features fast-inflate
+fast-inflate = ["flate2/zlib-ng"]
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"          # full cross-crate LTO — inlines the rift-raknet/flate2 hot path into the relay loop
 codegen-units = 1
 panic = "abort"
 strip = true        # Strip debug symbols to reduce release binary size

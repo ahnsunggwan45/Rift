@@ -24,7 +24,8 @@ const ZLIB_LEVEL: u32 = 7;
 
 /// Decompresses raw DEFLATE data (no zlib header).
 pub fn inflate_raw(data: &[u8]) -> Result<Vec<u8>> {
-    let mut decoder = DeflateDecoder::new(Vec::new());
+    // Pre-size the output to cut reallocations during inflate (typical DEFLATE ratio is a few ×).
+    let mut decoder = DeflateDecoder::new(Vec::with_capacity(data.len().saturating_mul(4)));
     decoder.write_all(data)?;
     Ok(decoder.finish()?)
 }

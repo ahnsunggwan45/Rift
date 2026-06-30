@@ -110,6 +110,12 @@ cargo build --release
 # → target/release/rift
 ```
 
+**Faster production build** (glibc) — enables the zlib-ng inflate backend (~1.5–2× faster down-stream decode):
+```bash
+cargo build --release --features fast-inflate
+```
+Needs a C toolchain + `cmake`. zlib-ng links statically (no runtime dependency). Like mimalloc it's a C dep, so it's off by default and **not** used by the musl build below.
+
 **Fully static Linux binary** (runs on any distro, no glibc-version or `musl-gcc` worries):
 ```bash
 rustup target add x86_64-unknown-linux-musl
