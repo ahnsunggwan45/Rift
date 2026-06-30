@@ -258,7 +258,10 @@ async fn relay(
 ) {
     use intercept::Outcome;
     let force_vv = cfg.features.force_vibrant_visuals;
-    let channel_transfer = cfg.features.channel_transfer;
+    let lazy = cfg.features.lazy_decode;
+    // Lazy mode disables in-stream transfer scanning: transfers arrive out-of-band (the control channel),
+    // so the steady-state down stream is never decoded. Off → legacy in-stream TransferPacket/entity scan.
+    let channel_transfer = if lazy { false } else { cfg.features.channel_transfer };
     let mut state = intercept::SessionState::default();
     let mut current_server = cfg.listener.default_server.clone();
     metrics.on_connect(&current_server);
@@ -321,7 +324,11 @@ async fn relay(
                 Ok(data) => {
                     let fwd_t0 = std::time::Instant::now();
                     metrics.on_bytes_down(data.len());
-                    match intercept::intercept_down(&mut state, &data, force_vv, channel_transfer, packs.as_deref()) {
+                    // Classification layer (independent, branch-only): record the tier this packet took,
+                    // then route. The metric proves how much of the stream stays on the cheap path.
+                    let route = intercept::classify_down(&state, &data, lazy, force_vv, channel_transfer, packs.is_some());
+                    metrics.on_down_route(route == intercept::Route::Inspect);
+                    match intercept::intercept_down(&mut state, &data, lazy, force_vv, channel_transfer, packs.as_deref()) {
                         Outcome::Forward => {
                             // zero-copy: forward the received Bytes to the client without copying.
                             if client.send_bytes(data, Reliability::ReliableOrdered).await.is_err() {

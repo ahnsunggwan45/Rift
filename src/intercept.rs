@@ -1,10 +1,19 @@
 //! Downstream→client game-packet interception (plaintext mode A).
 //!
-//! Hot-path philosophy: decode the batch to **peek packet IDs only**; handle only
-//! the packets we care about and forward everything else as raw bytes (no recompression).
-//! - VV flip: one-shot during the resource-pack phase (before chunks) → ignored afterwards.
-//! - TransferPacket detection: always watched, but **only small batches are decoded**
-//!   (large chunk batches are skipped) to avoid unnecessary overhead.
+//! ## Tiered classification (the cheapest stage first)
+//! Every message is routed by [`classify_down`] — a **branch-only** decision (no decompress, no varint
+//! of the batch, no allocation). It answers one question: *does this packet need game-level inspection?*
+//!   - **Tier 1 — pass-through:** forward the raw bytes untouched. The steady-state majority
+//!     (movement / entity sync / chunks) takes this path.
+//!   - **Tier 2/3 — inspect:** decompress + decode, for the handshake window only (NetworkSettings,
+//!     resource packs, Vibrant-Visuals flip) and, in legacy mode, the in-stream TransferPacket/entity scan.
+//!
+//! ## Lazy decode
+//! With `lazy_decode` on, once the session enters the world (StartGame) inspection is switched off for
+//! good — the down stream is pure pass-through. This is only sound when the proxy never *needs* to read
+//! the game stream in steady state: transfers must arrive out-of-band (the control channel) and backends
+//! must self-despawn entities on transfer. Off (legacy), the proxy keeps scanning for in-stream
+//! TransferPackets and tracks entities for teardown — correct, but it decodes every small batch.
 //!
 //! Game packets: `0xfe` + (after NetworkSettings) `[compression_type][data]`; raw batches before that.
 
@@ -25,6 +34,9 @@ const ID_RESOURCE_PACK_STACK: u32 = 0x07;
 const ID_RESOURCE_PACK_RESPONSE: u32 = 0x08;
 const ID_RESOURCE_PACK_CHUNK_REQUEST: u32 = 0x54;
 const ID_TRANSFER: u32 = 0x55;
+/// StartGamePacket (0x0b) — the boundary into in-world steady state. In lazy mode, seeing it ends the
+/// handshake inspection window for good (subsequent down traffic is pure pass-through).
+const ID_START_GAME: u32 = 0x0b;
 
 // ResourcePackClientResponse status.
 const RP_STATUS_REFUSED: u8 = 1;
@@ -52,6 +64,7 @@ const DOWN_INTEREST: [bool; 256] = interest(&[
     ID_RESOURCE_PACKS_INFO,
     ID_RESOURCE_PACK_STACK,
     ID_TRANSFER,
+    ID_START_GAME,
     packets::ID_BOSS_EVENT,
     packets::ID_SET_DISPLAY_OBJECTIVE,
     packets::ID_REMOVE_OBJECTIVE,
@@ -62,13 +75,59 @@ const DOWN_INTEREST: [bool; 256] = interest(&[
     packets::ID_REMOVE_ACTOR,
 ]);
 
-/// Fast-path threshold. Once past the initial VV/RP phase, batches larger than this are forwarded
-/// **opaquely** — no decompress, no decode, no allocation, zero-copy. They are chunk data; every packet
-/// Rift acts on (TransferPacket, entity Add/Remove, resource-pack) is far smaller. Decompressing only
-/// the smaller batches is what keeps the hot path cheap ("don't touch what we don't need to").
-/// Entities in a destination server's full spawn stream are captured separately during the handshake
-/// (downstream.rs), regardless of size, so this cap doesn't drop them on transfer.
-const MAX_DECODE_BATCH_BYTES: usize = 8192;
+/// Routing decision from the classification layer. Pass-through never touches the payload.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Route {
+    /// Tier 1: forward the raw bytes unchanged — no decompress, no decode, no allocation.
+    Passthrough,
+    /// Tier 2/3: the message must be decompressed and decoded for game-level handling.
+    Inspect,
+}
+
+/// The independent classification layer: decides whether a down message needs game-level inspection,
+/// using **only cheap branches** — the first byte and a few sticky session flags. No decompress, no
+/// varint of the batch, no allocation. This is deliberately the cheapest stage; the steady-state
+/// majority returns `Passthrough` here and is never decoded.
+pub fn classify_down(
+    state: &SessionState,
+    msg: &[u8],
+    lazy: bool,
+    force_vv: bool,
+    channel_transfer: bool,
+    rp_capable: bool,
+) -> Route {
+    // Non-game (RakNet-level) messages are bridged by the transport; nothing to inspect here.
+    if msg.first() != Some(&GAME_PACKET) {
+        return Route::Passthrough;
+    }
+    if inspect_needed(state, lazy, force_vv, channel_transfer, rp_capable) {
+        Route::Inspect
+    } else {
+        Route::Passthrough
+    }
+}
+
+/// Whether the current down message needs decoding. Sticky session flags make this a memoized decision
+/// (the "pass-through mode" cache): once the handshake is done, it stays `false` for the session's life.
+fn inspect_needed(
+    state: &SessionState,
+    lazy: bool,
+    force_vv: bool,
+    channel_transfer: bool,
+    rp_capable: bool,
+) -> bool {
+    let watching_vv = force_vv && !state.vv_done;
+    if lazy {
+        // Steady state: once in-world, never decode again (transfers/entities are handled out-of-band).
+        if state.in_world {
+            return false;
+        }
+        // Handshake window: decode until compression is known and the VV/RP setup is finished.
+        return !state.compression_on || watching_vv || rp_capable;
+    }
+    // Legacy: in-stream scanning. Decode whenever there is something to watch (exact prior behaviour).
+    watching_vv || channel_transfer || rp_capable
+}
 
 /// Per-connection session state (shared between the up and down paths).
 #[derive(Default)]
@@ -89,6 +148,9 @@ pub struct SessionState {
     /// Resource pack serving is active (proxy has replaced the downstream ResourcePacksInfo with its own pack list).
     /// Client RP responses are handled by the proxy; the downstream receives HAVE_ALL/COMPLETED.
     rp_serving: bool,
+    /// The session has entered the world (StartGame seen). In lazy mode this latches the down stream to
+    /// pure pass-through — the handshake inspection window is over.
+    in_world: bool,
 }
 
 impl SessionState {
@@ -288,38 +350,19 @@ pub enum Outcome {
 pub fn intercept_down(
     state: &mut SessionState,
     msg: &[u8],
+    lazy: bool,
     force_vv: bool,
     channel_transfer: bool,
     packs: Option<&PackStore>,
 ) -> Outcome {
-    if msg.first() != Some(&GAME_PACKET) {
+    // Classification layer first: a branch-only decision. Pass-through never touches the payload —
+    // no decompress, no decode, no allocation. There is deliberately no size threshold; the route is
+    // driven by *what the session needs*, not by how big a packet happens to be.
+    if classify_down(state, msg, lazy, force_vv, channel_transfer, packs.is_some()) == Route::Passthrough {
         return Outcome::Forward;
     }
 
     let watching_vv = force_vv && !state.vv_done;
-    let rp_active = packs.is_some();
-    if !watching_vv && !channel_transfer && !rp_active {
-        return Outcome::Forward; // nothing to watch → fully opaque
-    }
-
-    // FAST PATH: once past the initial VV/RP phase, forward large batches (chunk data) opaquely
-    // without decoding. This is the core "don't touch 99%" rule — the packets we act on (transfers,
-    // entity Add/Remove, RP) are all small, so only the smaller batches are decompressed. Applies
-    // regardless of channel_transfer; entity tracking still works because (a) destination spawn
-    // entities are seeded from the handshake spawn buffer (any size) and (b) live entity spawns are
-    // small batches under this cap.
-    if !watching_vv {
-        let payload = &msg[1..];
-        let data_len = if state.compression_on {
-            payload.len().saturating_sub(1)
-        } else {
-            payload.len()
-        };
-        if data_len > MAX_DECODE_BATCH_BYTES {
-            return Outcome::Forward;
-        }
-    }
-
     match try_intercept(state, msg, watching_vv, channel_transfer, packs) {
         Ok(outcome) => outcome,
         Err(e) => {
@@ -366,6 +409,8 @@ fn try_intercept(
         }
         match id {
             ID_NETWORK_SETTINGS => saw_network_settings = true,
+            // Entering the world ends the lazy-mode handshake window (latches pass-through).
+            ID_START_GAME => state.in_world = true,
             // RP serving: replace downstream ResourcePacksInfo with proxy packs (takes priority over VV flip).
             ID_RESOURCE_PACKS_INFO if packs.is_some() => rp_info_seen = true,
             ID_RESOURCE_PACKS_INFO if watching_vv => vv_idx = Some(i),
@@ -576,7 +621,7 @@ mod tests {
         let mut state = SessionState::default();
         // Downstream ResourcePacksInfo → replaced with proxy info + rp_serving set.
         let info_msg = frame_uncompressed(&[make_resource_packs_info(1)]);
-        match intercept_down(&mut state, &info_msg, true, true, Some(&store)) {
+        match intercept_down(&mut state, &info_msg, false, true, true, Some(&store)) {
             Outcome::Replace(_) => {}
             _ => panic!("expected Replace for RP info substitution"),
         }
@@ -595,7 +640,7 @@ mod tests {
         // With packs = None, the existing VV flip path is used (rp_serving stays false).
         let mut state = SessionState::default();
         let msg = frame_uncompressed(&[make_resource_packs_info(1)]);
-        match intercept_down(&mut state, &msg, true, true, None) {
+        match intercept_down(&mut state, &msg, false, true, true, None) {
             Outcome::Replace(_) => {}
             _ => panic!("expected Replace for VV flip"),
         }
@@ -606,7 +651,7 @@ mod tests {
     fn detects_transfer_and_reads_server_name() {
         let mut state = SessionState::default();
         let msg = frame_uncompressed(&[make_transfer("island1")]);
-        match intercept_down(&mut state, &msg, true, true, None) {
+        match intercept_down(&mut state, &msg, false, true, true, None) {
             Outcome::Transfer(s) => assert_eq!(s, "island1"),
             _ => panic!("expected Transfer to be detected"),
         }
@@ -616,7 +661,7 @@ mod tests {
     fn flips_vv() {
         let mut state = SessionState::default();
         let msg = frame_uncompressed(&[make_resource_packs_info(1)]);
-        match intercept_down(&mut state, &msg, true, true, None) {
+        match intercept_down(&mut state, &msg, false, true, true, None) {
             Outcome::Replace(out) => {
                 let packets = split_batch(&out[1..]).unwrap();
                 let (_, hl) = read_varint_u32(packets[0]).unwrap();
@@ -628,27 +673,61 @@ mod tests {
     }
 
     #[test]
-    fn large_batch_forwarded_opaque_fast_path() {
-        // Fast path: a batch larger than MAX_DECODE_BATCH_BYTES is forwarded opaquely (never decoded),
-        // even with channel_transfer on. This is the "don't touch chunk data" rule.
-        let mut state = SessionState { compression_on: true, vv_done: true, ..Default::default() };
-        let big = vec![GAME_PACKET; MAX_DECODE_BATCH_BYTES + 100];
-        assert!(matches!(
-            intercept_down(&mut state, &big, true, true, None),
-            Outcome::Forward
-        ));
+    fn classify_non_game_message_is_passthrough() {
+        // RakNet-level (non-0xfe) messages are bridged by the transport, never game-inspected.
+        let state = SessionState::default();
+        assert_eq!(
+            classify_down(&state, &[0x15, 1, 2, 3], false, true, true, true),
+            Route::Passthrough
+        );
     }
 
     #[test]
-    fn large_batch_forwarded_opaque_during_rp() {
-        // Same fast-path skip applies during RP serving (vv done) — large batches are never decoded.
-        let store = dummy_store();
-        let mut state = SessionState { compression_on: true, vv_done: true, rp_serving: true, ..Default::default() };
-        let big = vec![GAME_PACKET; MAX_DECODE_BATCH_BYTES + 100];
-        assert!(matches!(
-            intercept_down(&mut state, &big, false, false, Some(&store)),
-            Outcome::Forward
-        ));
+    fn lazy_passthrough_once_in_world() {
+        // Lazy mode, in-world: every down packet is pass-through — no decode, regardless of size or
+        // contents. A would-be TransferPacket batch and a huge batch are both forwarded untouched.
+        let mut state = SessionState { compression_on: true, vv_done: true, in_world: true, ..Default::default() };
+        let transfer_msg = frame_uncompressed(&[make_transfer("island1")]);
+        assert_eq!(classify_down(&state, &transfer_msg, true, true, false, false), Route::Passthrough);
+        let big = vec![GAME_PACKET; 65536];
+        assert_eq!(classify_down(&state, &big, true, true, false, true), Route::Passthrough);
+        assert!(matches!(intercept_down(&mut state, &big, true, true, false, None), Outcome::Forward));
+    }
+
+    #[test]
+    fn lazy_inspects_during_handshake() {
+        // Lazy mode, pre-world: inspect until compression is known and RP/VV setup is done.
+        let state = SessionState::default(); // compression_on=false, in_world=false
+        assert_eq!(classify_down(&state, &[GAME_PACKET, 0, 0], true, true, false, false), Route::Inspect);
+    }
+
+    #[test]
+    fn lazy_startgame_latches_in_world() {
+        // Decoding a batch containing StartGame flips in_world; afterwards classification is pass-through
+        // even though rp_capable is still true (it no longer forces inspection).
+        let mut state = SessionState::default(); // compression_on=false → uncompressed batch decodes
+        let mut sg = Vec::new();
+        write_varint_u32(ID_START_GAME, &mut sg);
+        sg.extend_from_slice(&[0u8; 4]);
+        let _ = intercept_down(&mut state, &frame_uncompressed(&[sg]), true, true, false, None);
+        assert!(state.in_world);
+        assert_eq!(
+            classify_down(&state, &frame_uncompressed(&[make_transfer("x")]), true, false, false, true),
+            Route::Passthrough
+        );
+    }
+
+    #[test]
+    fn legacy_inspects_with_channel_transfer() {
+        // Legacy mode: in_world is irrelevant; channel_transfer keeps inspection on, and an in-stream
+        // TransferPacket is still detected.
+        let mut state = SessionState { compression_on: false, vv_done: true, in_world: true, ..Default::default() };
+        let msg = frame_uncompressed(&[make_transfer("spawn2")]);
+        assert_eq!(classify_down(&state, &msg, false, true, true, false), Route::Inspect);
+        match intercept_down(&mut state, &msg, false, true, true, None) {
+            Outcome::Transfer(s) => assert_eq!(s, "spawn2"),
+            _ => panic!("legacy mode must still detect the in-stream transfer"),
+        }
     }
 
     #[test]
@@ -656,7 +735,7 @@ mod tests {
         let mut state = SessionState::default();
         let msg = frame_uncompressed(&[make_transfer("island1")]);
         assert!(matches!(
-            intercept_down(&mut state, &msg, false, false, None),
+            intercept_down(&mut state, &msg, false, false, false, None),
             Outcome::Forward
         ));
     }
@@ -666,7 +745,7 @@ mod tests {
         // Transfer is still watched after vv_done (small batches only).
         let mut state = SessionState { compression_on: false, vv_done: true, ..Default::default() };
         let msg = frame_uncompressed(&[make_transfer("spawn2")]);
-        match intercept_down(&mut state, &msg, true, true, None) {
+        match intercept_down(&mut state, &msg, false, true, true, None) {
             Outcome::Transfer(s) => assert_eq!(s, "spawn2"),
             _ => panic!("expected transfer to be detected even after vv_done"),
         }
@@ -679,7 +758,7 @@ mod tests {
         write_varint_u32(ID_NETWORK_SETTINGS, &mut ns);
         ns.extend_from_slice(&[0u8; 6]);
         let msg = frame_uncompressed(&[ns]);
-        let _ = intercept_down(&mut state, &msg, true, true, None);
+        let _ = intercept_down(&mut state, &msg, false, true, true, None);
         assert!(state.compression_on);
     }
 

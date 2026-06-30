@@ -105,13 +105,20 @@ pub struct Features {
     #[serde(default = "default_true")]
     pub force_vibrant_visuals: bool,
     /// Intercepts downstream `TransferPacket` (server name) and handles it as a transparent channel transfer.
+    /// Ignored when `lazy_decode` is on (transfers then arrive out-of-band via the control channel).
     #[serde(default = "default_true")]
     pub channel_transfer: bool,
+    /// Lazy-decode mode: once a session enters the world (StartGame), the down stream is forwarded as raw
+    /// bytes with **no decompress/decode** — true steady-state pass-through (Tier 1). Requires that
+    /// transfers arrive out-of-band (the `[control]` channel) and that backends self-despawn their entities
+    /// on transfer (so the proxy never needs to scan the game stream). Off = legacy in-stream scanning.
+    #[serde(default)]
+    pub lazy_decode: bool,
 }
 
 impl Default for Features {
     fn default() -> Self {
-        Self { force_vibrant_visuals: true, channel_transfer: true }
+        Self { force_vibrant_visuals: true, channel_transfer: true, lazy_decode: false }
     }
 }
 

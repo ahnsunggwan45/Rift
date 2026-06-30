@@ -51,6 +51,11 @@ pub struct Metrics {
     /// Forward-latency histogram (bucketed μs) → p50/p95/p99 in the snapshot. Captures the distribution
     /// the cumulative average hides (e.g. occasional chunk-decompress spikes). Hot-path cost: one atomic add.
     fwd_hist: [AtomicU64; FWD_BUCKETS.len() + 1],
+    /// Down-direction routing tiers (the independent classification layer): how many down game packets
+    /// were forwarded as raw bytes (Tier 1 pass-through — no decompress/decode/alloc) vs required
+    /// game-level inspection (Tier 2/3 decode). The ratio proves the steady-state stream stays cheap.
+    down_pass: AtomicU64,
+    down_inspect: AtomicU64,
     /// Server name → current player count (driven by plist/monitoring).
     per_server: RwLock<HashMap<String, usize>>,
 }
@@ -71,6 +76,8 @@ impl Default for Metrics {
             fwd_ns_total: AtomicU64::new(0),
             fwd_count: AtomicU64::new(0),
             fwd_hist: Default::default(),
+            down_pass: AtomicU64::new(0),
+            down_inspect: AtomicU64::new(0),
             per_server: RwLock::new(HashMap::new()),
         }
     }
@@ -97,6 +104,10 @@ pub struct MetricsSnapshot {
     pub forward_p50_us: u64,
     pub forward_p95_us: u64,
     pub forward_p99_us: u64,
+    /// Down-direction classification tiers: pass-through (raw forward, no decode) vs inspected (decoded).
+    /// In lazy-decode mode the steady-state stream should be almost entirely pass-through.
+    pub down_passthrough: u64,
+    pub down_inspect: u64,
     /// Cumulative allocation count/bytes. Non-zero only in profiling builds (`--features profiling`); zero otherwise.
     pub alloc_count: u64,
     pub alloc_bytes: u64,
@@ -126,6 +137,18 @@ impl Metrics {
     pub fn on_bytes_down(&self, n: usize) {
         self.bytes_down.fetch_add(n as u64, Relaxed);
         self.msgs_down.fetch_add(1, Relaxed);
+    }
+
+    /// Records the down-direction routing decision from the classification layer: `inspected = false`
+    /// means Tier 1 pass-through (raw forward, no decode); `true` means Tier 2/3 (decompress + decode).
+    /// One relaxed atomic add — the classification itself is branch-only.
+    #[inline]
+    pub fn on_down_route(&self, inspected: bool) {
+        if inspected {
+            self.down_inspect.fetch_add(1, Relaxed);
+        } else {
+            self.down_pass.fetch_add(1, Relaxed);
+        }
     }
 
     /// Records the processing time for one downstream forward (recv → client send complete) — used for average forward latency.
@@ -206,6 +229,8 @@ impl Metrics {
             forward_p50_us,
             forward_p95_us,
             forward_p99_us,
+            down_passthrough: self.down_pass.load(Relaxed),
+            down_inspect: self.down_inspect.load(Relaxed),
             alloc_count,
             alloc_bytes,
             per_server: self.per_server_snapshot(),
