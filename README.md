@@ -41,9 +41,9 @@ For production (auto-restart, console, firewall), see [Run](#run) and [`dist-lin
 
 ## How it works
 
-Rift terminates RakNet itself: clients connect to Rift, and Rift opens its own RakNet connection to each downstream server. Game packets are shuttled as opaque bytes — only login, transfer, resource-pack and a few spawn-related packets are decoded.
+Rift terminates RakNet itself: clients connect to Rift, and Rift opens its own RakNet connection to each downstream server. Game packets are shuttled as opaque bytes — a branch-only [classification layer](#design-principles) decodes only the handshake window (login, resource-pack, the Vibrant-Visuals flip) and, in legacy mode, the in-stream transfer/entity scan; everything else is forwarded raw.
 
-**Seamless transfer** (triggered by a downstream `TransferPacket`, or the console `transfer` command):
+**Seamless transfer** (triggered by a downstream `TransferPacket`, the out-of-band [control channel](#out-of-band-control), or the console `transfer` command):
 
 1. Rift connects to the target server and drives the handshake to full spawn, buffering the spawn stream.
 2. The previous server's client-side state is torn down: actor entities (`RemoveActor`), boss bars, scoreboards, and weather — so nothing lingers as a ghost.
@@ -54,7 +54,7 @@ Entity IDs are **not** rewritten. Instead, every server assigns the same player 
 
 ## Design principles
 
-- **Keep the fast path small** — the overwhelming majority of packets (movement, chunks, entity updates) are never decoded. Batches larger than a threshold are forwarded **opaquely** (no decompress, no decode, no allocation — the received `Bytes` are passed straight through); only the small batches that *can* carry a packet Rift acts on (transfer, entity Add/Remove, resource-pack) are decompressed and peeked via a single interest-bitmap lookup.
+- **Classify before you decode** — every down message is routed by an independent, **branch-only** classification layer (`classify_down`): no decompress, no varint of the batch, no allocation. It answers exactly one question — *does this packet need game-level inspection?* The steady-state majority (movement, entity sync, chunks) is forwarded as raw `Bytes` (**Tier 1 pass-through**); only the handshake window — and, in legacy mode, the in-stream transfer/entity scan — is decoded (**Tier 2/3**). There is **no size threshold**: the route is driven by what the session needs, not how big a packet happens to be. With `lazy_decode` on, once a session enters the world (StartGame) the down stream is latched to pure pass-through — the proxy never decodes steady-state traffic at all (transfers then arrive out-of-band via the control channel, and backends self-despawn entities on transfer). Per-tier counters at `/metrics` (`down_passthrough` / `down_inspect`) prove the ratio on a live server.
 - **Layer boundary: RakNet is transport-only** — `vendor/rift-raknet` knows nothing about Minecraft (no `0xfe`/game-packet assumptions); it moves opaque payloads with reliability/ordering/ACK. The Minecraft packet layer and all interception live in the proxy (`src/intercept.rs`, `src/packets.rs`). `UDP → RakNet → Minecraft packet layer → intercept`.
 - **Zero-copy forward, verifiable** — `recv()` yields `Bytes`; the fast path forwards them with `send_bytes()` (ref-counted slice, no copy, no clone). Only the slow path (a packet Rift rewrites) allocates. A `--features profiling` build exposes `alloc_count`/`alloc_bytes` at `/metrics` so the zero-allocation hot path is *checkable*, not just claimed.
 - **Own the transport** — the vendored RakNet fork is tuned directly: copy-minimized framing, bounded fragment reassembly (DoS-resistant), reliable-packet de-duplication, configurable ACK tick.
@@ -154,12 +154,31 @@ All options are documented in [`config.example.toml`](config.example.toml).
 | `kick <name\|id>` | disconnect a player |
 | `stop` | graceful shutdown |
 
+## Out-of-band control
+
+A trusted local backend can trigger transfers/kicks **without** putting anything into the game stream. Set `[control]` in `config.toml`:
+
+```toml
+[control]
+addr = "127.0.0.1:8090"     # bind to localhost — proxy and backends are co-located
+token = "shared-secret"
+```
+
+It's a line protocol (one command per line, one-line reply):
+
+```
+<token> transfer <name|xuid> <server>
+<token> kick <name|xuid>
+```
+
+This is the foundation of `lazy_decode`: when transfers arrive here instead of as an in-stream `TransferPacket`, the proxy never has to scan/decode the steady-state down stream — so it can stay a pure Tier-1 pass-through. Backends must also self-despawn a player's entities just before triggering the transfer (so nothing ghosts), since the proxy no longer tracks them. Until both are wired, leave `lazy_decode` off and the legacy in-stream path handles it.
+
 ## Web monitoring
 
 Set `web_addr` in `config.toml` (e.g. `"0.0.0.0:8080"`):
 
 - `http://<host>:8080/` — auto-refreshing dashboard
-- `GET /metrics` — JSON: active/peak players, throughput, packet rate, avg packet size, avg forward latency, transfers, per-server (plus `alloc_*` on a profiling build)
+- `GET /metrics` — JSON: active/peak players, throughput, packet rate, avg packet size, forward latency (avg + p50/p95/p99), classification tiers (`down_passthrough` / `down_inspect`), transfers, per-server (plus `alloc_*` on a profiling build)
 - `GET /players` — JSON: id, name, ip, server, ping (RTT), uptime
 
 > `/players` exposes player names and IPs — keep the port behind a firewall if it's reachable publicly.
@@ -199,11 +218,12 @@ Rift targets the Bedrock protocol used by current PocketMine-MP builds. The spec
 
 **Performance**
 - ✅ mimalloc (optional) · packet pass-through fast path
+- ✅ Tiered classification layer (branch-only route) + `lazy_decode` (zero-decode steady state) + per-tier metrics
 - ✅ Application-level zero-copy (Bytes data path)
 - ✅ Bounded fragment reassembly · reliable-packet de-dup
 - ✅ Profiling build with allocation counters (`--features profiling`)
 - ⬜ Buffer / packet pool · arena allocation
-- ⬜ `sendmmsg` / `recvmmsg` · worker sharding + `SO_REUSEPORT` · CPU affinity / NUMA
+- ⬜ `sendmmsg` / `recvmmsg` · GSO · worker sharding + `SO_REUSEPORT` · CPU affinity / NUMA — the real "socket-level" win (a true kernel/L4 pass-through is impossible here: Rift *terminates* RakNet on both hops to drive per-player transfers, so it must re-frame at the RakNet layer — Tier 1 is the floor, not Tier 0)
 - ⬜ io_uring · libdeflate
 
 **Networking**

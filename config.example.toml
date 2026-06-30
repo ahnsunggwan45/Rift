@@ -19,6 +19,11 @@ gametype = "Survival"
 [features]
 force_vibrant_visuals = true   # Re-enables Vibrant Visuals when the downstream has it turned off
 channel_transfer = true        # Intercepts downstream TransferPackets and handles them as seamless channel transfers
+# lazy_decode: once a session enters the world, forward the down stream as raw bytes with NO decompress/decode
+# (true steady-state pass-through — the cheapest path). Requires transfers to arrive out-of-band via [control]
+# and backends to self-despawn entities on transfer. Leave OFF unless both are in place; ON without them breaks
+# transfers/entity cleanup. When ON, channel_transfer is ignored (in-stream scanning is disabled).
+# lazy_decode = false
 
 # Resource pack serving (optional). The proxy serves .zip/.mcpack files from packs/ to clients — shared across all servers.
 [resource_packs]
