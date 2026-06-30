@@ -94,16 +94,30 @@ pub struct Features {
     /// Intercepts downstream `TransferPacket` (server name) and handles it as a transparent channel transfer.
     #[serde(default = "default_true")]
     pub channel_transfer: bool,
+    /// Max compressed batch size (bytes) the down path will decompress + decode to scan for TransferPackets /
+    /// entity Add-Remove / resource-pack packets. Larger batches (chunk data) are forwarded opaquely with no
+    /// decode. `0` disables the cap (decode every batch). Lower is cheaper but risks missing large entity-spawn
+    /// batches (→ ghost entities, as the historic 512 did once entity tracking was added); higher decodes more.
+    #[serde(default = "default_max_decode_batch_bytes")]
+    pub max_decode_batch_bytes: usize,
 }
 
 impl Default for Features {
     fn default() -> Self {
-        Self { force_vibrant_visuals: true, channel_transfer: true }
+        Self {
+            force_vibrant_visuals: true,
+            channel_transfer: true,
+            max_decode_batch_bytes: default_max_decode_batch_bytes(),
+        }
     }
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_max_decode_batch_bytes() -> usize {
+    crate::intercept::MAX_DECODE_BATCH_BYTES
 }
 
 /// MOTD the proxy presents in the server list. Defined independently of the downstream.

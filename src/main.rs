@@ -177,6 +177,7 @@ async fn run(cfg: Arc<Config>) -> Result<()> {
         %downstream_addr,
         force_vibrant_visuals = force_vv,
         channel_transfer,
+        max_decode_batch_bytes = cfg.features.max_decode_batch_bytes,
         "Rift Phase 1b-A (plaintext termination + interception) started"
     );
 
@@ -240,6 +241,7 @@ async fn relay(
     use intercept::Outcome;
     let force_vv = cfg.features.force_vibrant_visuals;
     let channel_transfer = cfg.features.channel_transfer;
+    let max_decode = cfg.features.max_decode_batch_bytes;
     let mut state = intercept::SessionState::default();
     let mut current_server = cfg.listener.default_server.clone();
     metrics.on_connect(&current_server);
@@ -302,7 +304,7 @@ async fn relay(
                 Ok(data) => {
                     let fwd_t0 = std::time::Instant::now();
                     metrics.on_bytes_down(data.len());
-                    match intercept::intercept_down(&mut state, &data, force_vv, channel_transfer, packs.as_deref()) {
+                    match intercept::intercept_down(&mut state, &data, force_vv, channel_transfer, max_decode, packs.as_deref()) {
                         Outcome::Forward => {
                             // zero-copy: forward the received Bytes to the client without copying.
                             if client.send_bytes(data, Reliability::ReliableOrdered).await.is_err() {

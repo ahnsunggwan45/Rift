@@ -62,13 +62,17 @@ const DOWN_INTEREST: [bool; 256] = interest(&[
     packets::ID_REMOVE_ACTOR,
 ]);
 
-/// Fast-path threshold. Once past the initial VV/RP phase, batches larger than this are forwarded
-/// **opaquely** — no decompress, no decode, no allocation, zero-copy. They are chunk data; every packet
-/// Rift acts on (TransferPacket, entity Add/Remove, resource-pack) is far smaller. Decompressing only
-/// the smaller batches is what keeps the hot path cheap ("don't touch what we don't need to").
-/// Entities in a destination server's full spawn stream are captured separately during the handshake
-/// (downstream.rs), regardless of size, so this cap doesn't drop them on transfer.
-const MAX_DECODE_BATCH_BYTES: usize = 8192;
+/// Default fast-path threshold (compressed batch bytes). Overridable via `[features] max_decode_batch_bytes`.
+/// Once past the initial VV/RP phase, batches larger than this are forwarded **opaquely** — no decompress,
+/// no decode, no allocation, zero-copy. They are chunk data; every packet Rift acts on (TransferPacket,
+/// entity Add/Remove, resource-pack) is far smaller, so decompressing only the smaller batches keeps the
+/// hot path cheap ("don't touch what we don't need to"). Entities in a destination server's full spawn
+/// stream are captured separately during the handshake (downstream.rs), regardless of size, so this cap
+/// doesn't drop them on transfer. A configured value of `0` disables the cap (decode every batch).
+///
+/// Lower = cheaper but risks missing entity-spawn batches that exceed it (→ ghost entities, as the historic
+/// 512 value did once entity tracking was added). Higher = more decode (incl. large batches) but safer.
+pub const MAX_DECODE_BATCH_BYTES: usize = 8192;
 
 /// Per-connection session state (shared between the up and down paths).
 #[derive(Default)]
@@ -290,6 +294,7 @@ pub fn intercept_down(
     msg: &[u8],
     force_vv: bool,
     channel_transfer: bool,
+    max_decode: usize,
     packs: Option<&PackStore>,
 ) -> Outcome {
     if msg.first() != Some(&GAME_PACKET) {
@@ -307,15 +312,15 @@ pub fn intercept_down(
     // entity Add/Remove, RP) are all small, so only the smaller batches are decompressed. Applies
     // regardless of channel_transfer; entity tracking still works because (a) destination spawn
     // entities are seeded from the handshake spawn buffer (any size) and (b) live entity spawns are
-    // small batches under this cap.
-    if !watching_vv {
+    // small batches under this cap. `max_decode == 0` disables the cap (decode every batch).
+    if !watching_vv && max_decode > 0 {
         let payload = &msg[1..];
         let data_len = if state.compression_on {
             payload.len().saturating_sub(1)
         } else {
             payload.len()
         };
-        if data_len > MAX_DECODE_BATCH_BYTES {
+        if data_len > max_decode {
             return Outcome::Forward;
         }
     }
@@ -576,7 +581,7 @@ mod tests {
         let mut state = SessionState::default();
         // Downstream ResourcePacksInfo → replaced with proxy info + rp_serving set.
         let info_msg = frame_uncompressed(&[make_resource_packs_info(1)]);
-        match intercept_down(&mut state, &info_msg, true, true, Some(&store)) {
+        match intercept_down(&mut state, &info_msg, true, true, MAX_DECODE_BATCH_BYTES, Some(&store)) {
             Outcome::Replace(_) => {}
             _ => panic!("expected Replace for RP info substitution"),
         }
@@ -595,7 +600,7 @@ mod tests {
         // With packs = None, the existing VV flip path is used (rp_serving stays false).
         let mut state = SessionState::default();
         let msg = frame_uncompressed(&[make_resource_packs_info(1)]);
-        match intercept_down(&mut state, &msg, true, true, None) {
+        match intercept_down(&mut state, &msg, true, true, MAX_DECODE_BATCH_BYTES, None) {
             Outcome::Replace(_) => {}
             _ => panic!("expected Replace for VV flip"),
         }
@@ -606,7 +611,7 @@ mod tests {
     fn detects_transfer_and_reads_server_name() {
         let mut state = SessionState::default();
         let msg = frame_uncompressed(&[make_transfer("island1")]);
-        match intercept_down(&mut state, &msg, true, true, None) {
+        match intercept_down(&mut state, &msg, true, true, MAX_DECODE_BATCH_BYTES, None) {
             Outcome::Transfer(s) => assert_eq!(s, "island1"),
             _ => panic!("expected Transfer to be detected"),
         }
@@ -616,7 +621,7 @@ mod tests {
     fn flips_vv() {
         let mut state = SessionState::default();
         let msg = frame_uncompressed(&[make_resource_packs_info(1)]);
-        match intercept_down(&mut state, &msg, true, true, None) {
+        match intercept_down(&mut state, &msg, true, true, MAX_DECODE_BATCH_BYTES, None) {
             Outcome::Replace(out) => {
                 let packets = split_batch(&out[1..]).unwrap();
                 let (_, hl) = read_varint_u32(packets[0]).unwrap();
@@ -634,7 +639,7 @@ mod tests {
         let mut state = SessionState { compression_on: true, vv_done: true, ..Default::default() };
         let big = vec![GAME_PACKET; MAX_DECODE_BATCH_BYTES + 100];
         assert!(matches!(
-            intercept_down(&mut state, &big, true, true, None),
+            intercept_down(&mut state, &big, true, true, MAX_DECODE_BATCH_BYTES, None),
             Outcome::Forward
         ));
     }
@@ -646,9 +651,25 @@ mod tests {
         let mut state = SessionState { compression_on: true, vv_done: true, rp_serving: true, ..Default::default() };
         let big = vec![GAME_PACKET; MAX_DECODE_BATCH_BYTES + 100];
         assert!(matches!(
-            intercept_down(&mut state, &big, false, false, Some(&store)),
+            intercept_down(&mut state, &big, false, false, MAX_DECODE_BATCH_BYTES, Some(&store)),
             Outcome::Forward
         ));
+    }
+
+    #[test]
+    fn configurable_threshold_caps_and_zero_disables() {
+        // A small custom cap skips the (larger) transfer batch → forwarded, transfer NOT detected.
+        let mut s1 = SessionState { compression_on: false, vv_done: true, ..Default::default() };
+        assert!(matches!(
+            intercept_down(&mut s1, &frame_uncompressed(&[make_transfer("island1")]), false, true, 4, None),
+            Outcome::Forward
+        ));
+        // max_decode = 0 disables the cap: the same batch is decoded → transfer detected.
+        let mut s2 = SessionState { compression_on: false, vv_done: true, ..Default::default() };
+        match intercept_down(&mut s2, &frame_uncompressed(&[make_transfer("island1")]), false, true, 0, None) {
+            Outcome::Transfer(t) => assert_eq!(t, "island1"),
+            _ => panic!("max_decode=0 must decode every batch (transfer should be detected)"),
+        }
     }
 
     #[test]
@@ -656,7 +677,7 @@ mod tests {
         let mut state = SessionState::default();
         let msg = frame_uncompressed(&[make_transfer("island1")]);
         assert!(matches!(
-            intercept_down(&mut state, &msg, false, false, None),
+            intercept_down(&mut state, &msg, false, false, MAX_DECODE_BATCH_BYTES, None),
             Outcome::Forward
         ));
     }
@@ -666,7 +687,7 @@ mod tests {
         // Transfer is still watched after vv_done (small batches only).
         let mut state = SessionState { compression_on: false, vv_done: true, ..Default::default() };
         let msg = frame_uncompressed(&[make_transfer("spawn2")]);
-        match intercept_down(&mut state, &msg, true, true, None) {
+        match intercept_down(&mut state, &msg, true, true, MAX_DECODE_BATCH_BYTES, None) {
             Outcome::Transfer(s) => assert_eq!(s, "spawn2"),
             _ => panic!("expected transfer to be detected even after vv_done"),
         }
@@ -679,7 +700,7 @@ mod tests {
         write_varint_u32(ID_NETWORK_SETTINGS, &mut ns);
         ns.extend_from_slice(&[0u8; 6]);
         let msg = frame_uncompressed(&[ns]);
-        let _ = intercept_down(&mut state, &msg, true, true, None);
+        let _ = intercept_down(&mut state, &msg, true, true, MAX_DECODE_BATCH_BYTES, None);
         assert!(state.compression_on);
     }
 
