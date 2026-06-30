@@ -141,7 +141,6 @@ tr:last-child td{border-bottom:none}.num{text-align:right}.mut{color:var(--mut)}
     <div class="card"><div class="k">Peak Concurrent</div><div class="v" id="peak">–</div></div>
     <div class="card"><div class="k">Total Bytes</div><div class="v" id="total_bytes">–</div></div>
     <div class="card"><div class="k">Forward Latency</div><div class="v" id="fwd">–<small> μs</small></div><div class="k" id="fwdpct" style="margin-top:3px">p50/95/99 –</div></div>
-    <div class="card"><div class="k">Down Pass-through</div><div class="v" id="passpct">–<small> %</small></div><div class="k" id="tiercnt" style="margin-top:3px">– pass / – inspect</div></div>
   </div>
   <h2>Players per Server</h2>
   <table><thead><tr><th>Server</th><th class="num">Players</th></tr></thead><tbody id="servers"></tbody></table>
@@ -173,9 +172,6 @@ async function tick(){
     document.getElementById('total_bytes').innerHTML=fmtBytes(m.bytes_up+m.bytes_down);
     document.getElementById('fwd').innerHTML=m.avg_forward_us+'<small> μs avg</small>';
     document.getElementById('fwdpct').textContent='p50 '+m.forward_p50_us+' · p95 '+m.forward_p95_us+' · p99 '+m.forward_p99_us+' μs';
-    {const dp=m.down_passthrough||0,di=m.down_inspect||0,dt=dp+di;
-     document.getElementById('passpct').innerHTML=(dt?Math.round(dp*100/dt):0)+'<small> %</small>';
-     document.getElementById('tiercnt').textContent=dp.toLocaleString()+' pass / '+di.toLocaleString()+' inspect';}
     if(m.alloc_count>0){document.getElementById('alloc_card').style.display='';
       document.getElementById('alloc').innerHTML=m.alloc_count.toLocaleString()+'<small> ('+Math.round(m.alloc_bytes/1048576)+' MiB)</small>';}
     const sv=Object.entries(m.per_server).sort((a,b)=>b[1]-a[1]);

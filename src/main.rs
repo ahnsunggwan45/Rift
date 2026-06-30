@@ -29,7 +29,6 @@ static GLOBAL_PROF: profiling::CountingAllocator = profiling::CountingAllocator;
 mod compression;
 mod config;
 mod console;
-mod control;
 mod crypto;
 mod downstream;
 mod framing;
@@ -171,24 +170,6 @@ async fn run(cfg: Arc<Config>) -> Result<()> {
     // Console commands (stdin). Exits silently on EOF when running in the background.
     console::spawn(registry.clone(), metrics.clone(), shutdown.clone());
 
-    // Out-of-band control channel (optional). Lets a trusted local backend (RiftSupport) trigger
-    // transfers/kicks without putting anything in the game stream — the basis for keeping the
-    // down-stream relay a pure pass-through (no scanning/decoding for TransferPackets).
-    match (cfg.control.addr.clone(), cfg.control.token.clone()) {
-        (Some(addr), Some(token)) => {
-            let reg = registry.clone();
-            tokio::spawn(async move {
-                if let Err(e) = control::serve(addr, token, reg).await {
-                    tracing::error!("control channel failed: {e}");
-                }
-            });
-        }
-        (Some(_), None) => {
-            tracing::warn!("control.addr set but control.token missing — control channel disabled");
-        }
-        _ => {}
-    }
-
     listener.listen().await;
     tracing::info!(
         %listen_addr,
@@ -258,10 +239,7 @@ async fn relay(
 ) {
     use intercept::Outcome;
     let force_vv = cfg.features.force_vibrant_visuals;
-    let lazy = cfg.features.lazy_decode;
-    // Lazy mode disables in-stream transfer scanning: transfers arrive out-of-band (the control channel),
-    // so the steady-state down stream is never decoded. Off → legacy in-stream TransferPacket/entity scan.
-    let channel_transfer = if lazy { false } else { cfg.features.channel_transfer };
+    let channel_transfer = cfg.features.channel_transfer;
     let mut state = intercept::SessionState::default();
     let mut current_server = cfg.listener.default_server.clone();
     metrics.on_connect(&current_server);
@@ -324,11 +302,7 @@ async fn relay(
                 Ok(data) => {
                     let fwd_t0 = std::time::Instant::now();
                     metrics.on_bytes_down(data.len());
-                    // Classification layer (independent, branch-only): record the tier this packet took,
-                    // then route. The metric proves how much of the stream stays on the cheap path.
-                    let route = intercept::classify_down(&state, &data, lazy, force_vv, channel_transfer, packs.is_some());
-                    metrics.on_down_route(route == intercept::Route::Inspect);
-                    match intercept::intercept_down(&mut state, &data, lazy, force_vv, channel_transfer, packs.as_deref()) {
+                    match intercept::intercept_down(&mut state, &data, force_vv, channel_transfer, packs.as_deref()) {
                         Outcome::Forward => {
                             // zero-copy: forward the received Bytes to the client without copying.
                             if client.send_bytes(data, Reliability::ReliableOrdered).await.is_err() {

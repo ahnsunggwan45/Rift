@@ -26,19 +26,6 @@ pub struct Config {
     pub runtime: Runtime,
     #[serde(default)]
     pub metrics: MetricsCfg,
-    #[serde(default)]
-    pub control: ControlCfg,
-}
-
-/// Out-of-band control channel. A trusted local backend (e.g. the RiftSupport plugin) connects here to
-/// trigger seamless transfers, so the proxy never has to scan/decode the game stream for TransferPackets
-/// — the basis of the zero-decode fast path. Disabled unless `addr` is set.
-#[derive(Debug, Deserialize, Default)]
-pub struct ControlCfg {
-    /// TCP bind address (e.g. `"127.0.0.1:8090"`). Bind to localhost — the proxy and backends are co-located.
-    pub addr: Option<String>,
-    /// Shared token gating commands. Required when `addr` is set; commands without it are rejected.
-    pub token: Option<String>,
 }
 
 /// Runtime tuning. If `worker_threads` is unset, Tokio defaults to the number of logical cores.
@@ -105,20 +92,13 @@ pub struct Features {
     #[serde(default = "default_true")]
     pub force_vibrant_visuals: bool,
     /// Intercepts downstream `TransferPacket` (server name) and handles it as a transparent channel transfer.
-    /// Ignored when `lazy_decode` is on (transfers then arrive out-of-band via the control channel).
     #[serde(default = "default_true")]
     pub channel_transfer: bool,
-    /// Lazy-decode mode: once a session enters the world (StartGame), the down stream is forwarded as raw
-    /// bytes with **no decompress/decode** — true steady-state pass-through (Tier 1). Requires that
-    /// transfers arrive out-of-band (the `[control]` channel) and that backends self-despawn their entities
-    /// on transfer (so the proxy never needs to scan the game stream). Off = legacy in-stream scanning.
-    #[serde(default)]
-    pub lazy_decode: bool,
 }
 
 impl Default for Features {
     fn default() -> Self {
-        Self { force_vibrant_visuals: true, channel_transfer: true, lazy_decode: false }
+        Self { force_vibrant_visuals: true, channel_transfer: true }
     }
 }
 

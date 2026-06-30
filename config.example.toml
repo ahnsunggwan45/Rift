@@ -19,11 +19,6 @@ gametype = "Survival"
 [features]
 force_vibrant_visuals = true   # Re-enables Vibrant Visuals when the downstream has it turned off
 channel_transfer = true        # Intercepts downstream TransferPackets and handles them as seamless channel transfers
-# lazy_decode: once a session enters the world, forward the down stream as raw bytes with NO decompress/decode
-# (true steady-state pass-through — the cheapest path). Requires transfers to arrive out-of-band via [control]
-# and backends to self-despawn entities on transfer. Leave OFF unless both are in place; ON without them breaks
-# transfers/entity cleanup. When ON, channel_transfer is ignored (in-stream scanning is disabled).
-# lazy_decode = false
 
 # Resource pack serving (optional). The proxy serves .zip/.mcpack files from packs/ to clients — shared across all servers.
 [resource_packs]
@@ -47,14 +42,6 @@ log_interval_secs = 0          # >0 logs throughput and player count periodicall
 # Performance data collection: when enabled, appends a metrics snapshot as JSONL every N seconds for offline analysis.
 # history_file = "metrics.jsonl"
 # history_interval_secs = 10
-
-# Out-of-band control channel (optional). A trusted local backend (e.g. the RiftSupport plugin) connects
-# here to trigger seamless transfers/kicks WITHOUT sending a TransferPacket through the game stream —
-# so the proxy never has to scan/decode the down stream (zero-decode fast path). Bind to localhost.
-# Line protocol:  <token> transfer <name|xuid> <server>   /   <token> kick <name|xuid>
-# [control]
-# addr = "127.0.0.1:8090"
-# token = "change-me-shared-secret"
 
 # Downstream channels. Key = channel name (transfer target), address = backend server address (hostnames supported).
 [servers]
