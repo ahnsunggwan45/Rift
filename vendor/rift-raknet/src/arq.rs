@@ -457,6 +457,12 @@ pub struct RecvQ {
 }
 
 impl RecvQ {
+    /// If this many ordered frames pile up undelivered, assume the frame at `last_ordered_index` is
+    /// permanently missing (ACKed-but-undelivered — e.g. a fragment dropped by the reassembly cap, so
+    /// retransmit never fills it) and skip the gap instead of freezing forever. Set well above the
+    /// normal loss-recovery reorder buffer (≈ receive-rate × RTO), so legitimate reordering never trips it.
+    const ORDERED_STALL_LIMIT: usize = 1024;
+
     pub fn new() -> Self {
         Self {
             sequence_number_ackset: ACKSet::new(),
@@ -567,6 +573,26 @@ impl RecvQ {
 
     pub fn flush(&mut self, _peer_addr: &SocketAddr) -> Vec<FrameSetPacket> {
         let mut ret = vec![];
+
+        // Self-heal a head-of-line stall: if the ordered frame at `last_ordered_index` is permanently
+        // missing, every later ordered frame queues behind it forever — ordered delivery freezes while
+        // the connection stays alive (the classic "connected but nothing works" hang). When the backlog
+        // grows past ORDERED_STALL_LIMIT the gap is treated as unfillable and skipped to the lowest queued
+        // index so delivery resumes. A brief ordering skip is far better than a permanently frozen session.
+        if self.ordered_packets.len() >= Self::ORDERED_STALL_LIMIT {
+            if let Some(&min_key) = self.ordered_packets.keys().min() {
+                if min_key > self.last_ordered_index {
+                    raknet_log_debug!(
+                        "ordered HoL stall: skipping index {}..{} ({} queued)",
+                        self.last_ordered_index,
+                        min_key,
+                        self.ordered_packets.len()
+                    );
+                    self.last_ordered_index = min_key;
+                }
+            }
+        }
+
         let mut ordered_keys: Vec<u32> = self.ordered_packets.keys().cloned().collect();
 
         ordered_keys.sort_unstable();
@@ -976,6 +1002,44 @@ async fn test_recvq() {
 
     let ret = r.flush(&"0.0.0.0:0".parse().unwrap());
     assert!(ret.len() == 2);
+}
+
+#[tokio::test]
+async fn test_recvq_ordered_stall_self_heal() {
+    // Ordered index 0 is permanently missing (ACKed-but-undelivered). Without self-heal, every later
+    // ordered frame queues behind it forever and the session freezes. Pile up ORDERED_STALL_LIMIT frames
+    // behind the gap, then flush must skip the gap and drain the backlog.
+    let mut r = RecvQ::new();
+    let limit = RecvQ::ORDERED_STALL_LIMIT as u32;
+    for i in 1..=limit {
+        let mut p = FrameSetPacket::new(Reliability::ReliableOrdered, vec![]);
+        p.sequence_number = i;
+        p.ordered_frame_index = i;
+        p.reliable_frame_index = i;
+        r.insert(p).unwrap();
+    }
+    let ret = r.flush(&"0.0.0.0:0".parse().unwrap());
+    assert_eq!(
+        ret.len(),
+        limit as usize,
+        "self-heal should skip the missing index 0 and drain the stalled ordered backlog"
+    );
+}
+
+#[tokio::test]
+async fn test_recvq_ordered_no_false_skip_under_limit() {
+    // Below the limit, a head-of-line gap must NOT be skipped — the missing frame may still arrive via
+    // retransmit. Nothing should be delivered while index 0 is outstanding.
+    let mut r = RecvQ::new();
+    for i in 1..10u32 {
+        let mut p = FrameSetPacket::new(Reliability::ReliableOrdered, vec![]);
+        p.sequence_number = i;
+        p.ordered_frame_index = i;
+        p.reliable_frame_index = i;
+        r.insert(p).unwrap();
+    }
+    let ret = r.flush(&"0.0.0.0:0".parse().unwrap());
+    assert_eq!(ret.len(), 0, "a small ordered gap must hold (no premature skip)");
 }
 
 #[tokio::test]

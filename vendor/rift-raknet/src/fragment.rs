@@ -84,22 +84,26 @@ impl FragmentQ {
         if frame.compound_size == 0 || frame.compound_size > MAX_COMPOUND_SIZE {
             return;
         }
-        if self.fragments.contains_key(&frame.compound_id) {
-            self.fragments
-                .get_mut(&frame.compound_id)
-                .unwrap()
-                .insert(frame);
-        } else {
-            // New compound: reject if we already have too many incomplete compounds —
-            // prevents DoS via accumulation of many distinct incomplete compounds.
-            if self.fragments.len() >= MAX_CONCURRENT_COMPOUNDS {
+        if let Some(existing) = self.fragments.get_mut(&frame.compound_id) {
+            // All fragments of one compound carry the same compound_size, so a mismatch means the u16
+            // `compound_id` wrapped (~every 65536 fragmented packets) and was reused for a DIFFERENT
+            // packet while a stale incomplete compound still held this id. Merging the new fragments into
+            // the stale one makes the new packet never assemble → a permanent ordered-delivery stall
+            // (the ~30-minute freeze). Drop the stale compound and start the new one fresh.
+            if existing.compound_size == frame.compound_size {
+                existing.insert(frame);
                 return;
             }
-            let mut v = Fragment::new(frame.flags, frame.compound_size, frame.ordered_frame_index);
-            let k = frame.compound_id;
-            v.insert(frame);
-            self.fragments.insert(k, v);
+            self.fragments.remove(&frame.compound_id);
+        } else if self.fragments.len() >= MAX_CONCURRENT_COMPOUNDS {
+            // New compound: reject if we already have too many incomplete compounds —
+            // prevents DoS via accumulation of many distinct incomplete compounds.
+            return;
         }
+        let mut v = Fragment::new(frame.flags, frame.compound_size, frame.ordered_frame_index);
+        let k = frame.compound_id;
+        v.insert(frame);
+        self.fragments.insert(k, v);
     }
 
     pub fn flush(&mut self) -> Result<Vec<FrameSetPacket>> {
@@ -156,6 +160,20 @@ mod tests {
             MAX_CONCURRENT_COMPOUNDS,
             "concurrent incomplete compounds must be capped at the limit"
         );
+    }
+
+    #[test]
+    fn compound_id_reuse_starts_fresh() {
+        // A stale incomplete compound (id 5, size 3, only fragment 0) lingers. The u16 compound_id then
+        // wraps and is reused for a DIFFERENT packet (id 5, size 2). The new packet must assemble on its
+        // own rather than colliding with the stale compound and stalling forever.
+        let mut q = FragmentQ::new();
+        q.insert(make(5, 3, 0)); // stale: missing fragments 1,2 — never completes
+        q.insert(make(5, 2, 0)); // reused id, different size → must start fresh
+        q.insert(make(5, 2, 1));
+        let flushed = q.flush().unwrap();
+        assert_eq!(flushed.len(), 1, "reused compound_id must assemble the new packet, not stall on the stale one");
+        assert_eq!(q.size(), 0, "the completed (replacement) compound must be removed");
     }
 
     #[test]
