@@ -195,6 +195,7 @@ async fn run(cfg: Arc<Config>) -> Result<()> {
                         conn_s = s.connected_secs,
                         ordered_idx = s.ordered_index,
                         recvq_backlog = s.ordered_backlog,
+                        fragment_queue = s.fragment_queue,
                         ordered_dropped = s.ordered_dropped,
                         sendq_unacked = s.sendq_unacked,
                         "diag"
@@ -351,8 +352,8 @@ async fn relay(
                 let rtt = client.rtt().await;
                 registry.set_rtt(session_id, rtt.max(0) as u32);
                 // Sample the backend connection's ordered-delivery state for the dashboard (stall watching).
-                let (oi, ob, _od_delivered, odrop, su) = server.reliability_diag();
-                health.set_diag(oi, ob, odrop, su);
+                let (oi, ob, _od_delivered, odrop, su, ofrag) = server.reliability_diag();
+                health.set_diag(oi, ob, ofrag, odrop, su);
                 // Silent-freeze detector: downstream data has stopped reaching the client for a while, yet the
                 // client is still actively sending. Dump the RakNet queue depths so the stalled layer shows up
                 // (server_recvq_* deep = backend→proxy ordered/fragment stall; client_sendq_* deep = client not

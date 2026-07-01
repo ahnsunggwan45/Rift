@@ -983,18 +983,19 @@ impl RaknetSocket {
     /// Watch `next_ordered_index` climb toward and past 16,777,216 (the 24-bit wrap) — it must keep
     /// advancing, not stick. A rising `ordered_dropped_behind` during a freeze is the wraparound signature.
     /// Non-blocking try-locks; `usize::MAX` means the lock was held.
-    pub fn reliability_diag(&self) -> (u32, usize, u64, u64, usize) {
-        let (idx, backlog, delivered, dropped) = match self.recvq.try_lock() {
+    pub fn reliability_diag(&self) -> (u32, usize, u64, u64, usize, usize) {
+        let (idx, backlog, delivered, dropped, frag) = match self.recvq.try_lock() {
             Ok(rq) => (
                 rq.ordered_index(),
                 rq.get_ordered_packet(),
                 rq.ordered_delivered(),
                 rq.ordered_dropped_behind(),
+                rq.get_fragment_queue_size(),
             ),
-            Err(_) => (0, usize::MAX, 0, 0),
+            Err(_) => (0, usize::MAX, 0, 0, usize::MAX),
         };
         let unacked = self.sendq.try_read().map(|sq| sq.get_sent_queue_size()).unwrap_or(usize::MAX);
-        (idx, backlog, delivered, dropped, unacked)
+        (idx, backlog, delivered, dropped, unacked, frag)
     }
 
     /// Returns the socket address of the remote peer of this Raknet connection.

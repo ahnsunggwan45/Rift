@@ -58,6 +58,7 @@ pub struct Health {
     /// without sticking; a rising `srv_ordered_dropped` while frozen is the ordered-index-wrap signature.
     pub srv_ordered_index: AtomicU64,
     pub srv_ordered_backlog: AtomicU64,
+    pub srv_fragment_queue: AtomicU64,
     pub srv_ordered_dropped: AtomicU64,
     pub srv_sendq_unacked: AtomicU64,
 }
@@ -74,9 +75,10 @@ impl Health {
         self.loop_beat.fetch_add(1, Relaxed);
     }
     /// Sample the backend connection's reliability state (called periodically from the relay).
-    pub fn set_diag(&self, ordered_index: u32, backlog: usize, dropped: u64, sendq_unacked: usize) {
+    pub fn set_diag(&self, ordered_index: u32, backlog: usize, frag: usize, dropped: u64, sendq_unacked: usize) {
         self.srv_ordered_index.store(ordered_index as u64, Relaxed);
         self.srv_ordered_backlog.store(backlog as u64, Relaxed);
+        self.srv_fragment_queue.store(frag as u64, Relaxed);
         self.srv_ordered_dropped.store(dropped, Relaxed);
         self.srv_sendq_unacked.store(sendq_unacked as u64, Relaxed);
     }
@@ -118,6 +120,7 @@ pub struct SessionInfo {
     /// advancing (and wrap past 2^24) — a stuck value or rising `ordered_dropped` signals a stall.
     pub ordered_index: u64,
     pub ordered_backlog: u64,
+    pub fragment_queue: u64,
     pub ordered_dropped: u64,
     pub sendq_unacked: u64,
 }
@@ -209,6 +212,7 @@ impl Registry {
                         rtt_ms: e.rtt_ms,
                         ordered_index: e.health.srv_ordered_index.load(Relaxed),
                         ordered_backlog: e.health.srv_ordered_backlog.load(Relaxed),
+                        fragment_queue: e.health.srv_fragment_queue.load(Relaxed),
                         ordered_dropped: e.health.srv_ordered_dropped.load(Relaxed),
                         sendq_unacked: e.health.srv_sendq_unacked.load(Relaxed),
                     })
