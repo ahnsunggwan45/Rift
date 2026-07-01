@@ -177,11 +177,16 @@ async fn run(cfg: Arc<Config>) -> Result<()> {
     if cfg.metrics.diag_log_secs > 0 {
         let reg = registry.clone();
         let secs = cfg.metrics.diag_log_secs.max(1);
+        tracing::info!(interval_secs = secs, "diagnostic console stream ENABLED — per-session reliability lines follow (tag: diag)");
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(secs));
             loop {
                 tick.tick().await;
-                for s in reg.snapshot() {
+                let sessions = reg.snapshot();
+                if sessions.is_empty() {
+                    tracing::info!("diag: no connected sessions");
+                }
+                for s in sessions {
                     tracing::info!(
                         session = s.id,
                         name = ?s.name,
