@@ -145,7 +145,7 @@ tr:last-child td{border-bottom:none}.num{text-align:right}.mut{color:var(--mut)}
   <h2>Players per Server</h2>
   <table><thead><tr><th>Server</th><th class="num">Players</th></tr></thead><tbody id="servers"></tbody></table>
   <h2>Connected Players</h2>
-  <table><thead><tr><th>Name</th><th>IP</th><th>Server</th><th class="num">Ping</th><th class="num">Connected</th><th class="num">Ordered idx</th><th class="num">recvQ/frag/drop/sendQ</th></tr></thead><tbody id="players"></tbody></table>
+  <table><thead><tr><th>Name</th><th>IP</th><th>Server</th><th class="num">Ping</th><th class="num">Connected</th><th class="num">Ordered idx</th><th class="num">bk/frag/drop/sendQ</th><th class="num">→cli sendQ/bk</th></tr></thead><tbody id="players"></tbody></table>
   <p class="mut" id="err"></p>
 </div>
 <script>
@@ -176,7 +176,13 @@ async function tick(){
       document.getElementById('alloc').innerHTML=m.alloc_count.toLocaleString()+'<small> ('+Math.round(m.alloc_bytes/1048576)+' MiB)</small>';}
     const sv=Object.entries(m.per_server).sort((a,b)=>b[1]-a[1]);
     document.getElementById('servers').innerHTML=sv.length?sv.map(([k,v])=>`<tr><td>${k}</td><td class="num">${v}</td></tr>`).join(''):'<tr><td colspan=2 class="mut">none</td></tr>';
-    document.getElementById('players').innerHTML=p.length?p.map(x=>{const bad=(x.ordered_backlog||x.fragment_queue||x.ordered_dropped||x.sendq_unacked);const q=(x.ordered_backlog||0)+'/'+(x.fragment_queue||0)+'/'+(x.ordered_dropped||0)+'/'+(x.sendq_unacked||0);return `<tr><td>${x.name||'<span class=mut>?</span>'}</td><td class="mut">${x.peer}</td><td><span class="pill">${x.server}</span></td><td class="num">${x.rtt_ms?x.rtt_ms+'ms':'–'}</td><td class="num mut">${fmtDur(x.connected_secs)}</td><td class="num mut">${(x.ordered_index||0).toLocaleString()}</td><td class="num" style="${bad?'color:var(--accent);font-weight:600':'color:var(--ok)'}">${bad?q:'ok'}</td></tr>`}).join(''):'<tr><td colspan=7 class="mut">none</td></tr>';
+    document.getElementById('players').innerHTML=p.length?p.map(x=>{
+      // Stall signals are the *backlogs/drops* (a stuck queue), NOT sendq_unacked (normal in-flight).
+      const srvBad=(x.ordered_backlog||x.fragment_queue||x.ordered_dropped);
+      const srv=(x.ordered_backlog||0)+'/'+(x.fragment_queue||0)+'/'+(x.ordered_dropped||0)+'/'+(x.sendq_unacked||0);
+      const cliBad=(x.cli_ordered_backlog||0)>0;
+      const cli=(x.cli_sendq_unacked||0)+'/'+(x.cli_ordered_backlog||0);
+      return `<tr><td>${x.name||'<span class=mut>?</span>'}</td><td class="mut">${x.peer}</td><td><span class="pill">${x.server}</span></td><td class="num">${x.rtt_ms?x.rtt_ms+'ms':'–'}</td><td class="num mut">${fmtDur(x.connected_secs)}</td><td class="num mut">${(x.ordered_index||0).toLocaleString()}</td><td class="num" style="${srvBad?'color:var(--accent);font-weight:600':'color:var(--ok)'}">${srvBad?srv:'ok'}</td><td class="num" style="${cliBad?'color:var(--accent);font-weight:600':'color:var(--ok)'}">${cliBad?cli:'ok'}</td></tr>`}).join(''):'<tr><td colspan=8 class="mut">none</td></tr>';
     document.getElementById('err').textContent='';
   }catch(e){document.getElementById('err').textContent='Connection lost — retrying…';}
 }

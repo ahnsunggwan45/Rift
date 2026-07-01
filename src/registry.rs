@@ -61,6 +61,10 @@ pub struct Health {
     pub srv_fragment_queue: AtomicU64,
     pub srv_ordered_dropped: AtomicU64,
     pub srv_sendq_unacked: AtomicU64,
+    /// Client connection (proxy→client): unacked down packets + up ordered backlog. If the client stops
+    /// receiving forwarded down data while the backend keeps sending it, cli_sendq_unacked climbs here.
+    pub cli_sendq_unacked: AtomicU64,
+    pub cli_ordered_backlog: AtomicU64,
 }
 
 impl Health {
@@ -75,12 +79,15 @@ impl Health {
         self.loop_beat.fetch_add(1, Relaxed);
     }
     /// Sample the backend connection's reliability state (called periodically from the relay).
-    pub fn set_diag(&self, ordered_index: u32, backlog: usize, frag: usize, dropped: u64, sendq_unacked: usize) {
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_diag(&self, ordered_index: u32, backlog: usize, frag: usize, dropped: u64, sendq_unacked: usize, cli_sendq: usize, cli_backlog: usize) {
         self.srv_ordered_index.store(ordered_index as u64, Relaxed);
         self.srv_ordered_backlog.store(backlog as u64, Relaxed);
         self.srv_fragment_queue.store(frag as u64, Relaxed);
         self.srv_ordered_dropped.store(dropped, Relaxed);
         self.srv_sendq_unacked.store(sendq_unacked as u64, Relaxed);
+        self.cli_sendq_unacked.store(cli_sendq as u64, Relaxed);
+        self.cli_ordered_backlog.store(cli_backlog as u64, Relaxed);
     }
 }
 
@@ -123,6 +130,8 @@ pub struct SessionInfo {
     pub fragment_queue: u64,
     pub ordered_dropped: u64,
     pub sendq_unacked: u64,
+    pub cli_sendq_unacked: u64,
+    pub cli_ordered_backlog: u64,
 }
 
 #[derive(Default)]
@@ -215,6 +224,8 @@ impl Registry {
                         fragment_queue: e.health.srv_fragment_queue.load(Relaxed),
                         ordered_dropped: e.health.srv_ordered_dropped.load(Relaxed),
                         sendq_unacked: e.health.srv_sendq_unacked.load(Relaxed),
+                        cli_sendq_unacked: e.health.cli_sendq_unacked.load(Relaxed),
+                        cli_ordered_backlog: e.health.cli_ordered_backlog.load(Relaxed),
                     })
                     .collect()
             })
