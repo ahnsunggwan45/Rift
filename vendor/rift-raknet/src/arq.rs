@@ -471,6 +471,16 @@ impl RecvQ {
     /// normal retransmit recovery (a few RTOs), so healthy loss recovery never trips it.
     const ORDERED_STALL_MS: i64 = 8000;
 
+    /// `ordered_frame_index` is a 24-bit value on the wire (RakNet), so it wraps at 2^24. The next-expected
+    /// index and the "already delivered" comparison must be modular — otherwise, after the wrap, every new
+    /// frame (index 0, 1, …) looks numerically smaller than `last_ordered_index` (~16.7M) and gets dropped,
+    /// freezing ordered delivery until the connection is remade. That is the root of the "connected but
+    /// frozen" hang that only a transfer (fresh connection) cleared and the self-heal couldn't (nothing
+    /// queues in ordered_packets — the frames are dropped outright). On a dense server the down ordered
+    /// rate is high enough to reach the wrap in tens of minutes.
+    const ORDERED_INDEX_MASK: u32 = 0x00FF_FFFF;
+    const ORDERED_INDEX_HALF: u32 = 0x0080_0000;
+
     pub fn new() -> Self {
         Self {
             sequence_number_ackset: ACKSet::new(),
@@ -537,8 +547,13 @@ impl RecvQ {
             }
             // RELIABLE_ORDERED - 1, 2, 3, 4, 5, 6
             Reliability::ReliableOrdered => {
-                // if remote host not received ack , and local program has flush ordered packet. recvq will insert old packet caused memory leak.
-                if frame.ordered_frame_index < self.last_ordered_index {
+                // Drop already-delivered ordered frames — but use a 24-bit *modular* comparison, not a
+                // naive `<`. ordered_frame_index wraps at 2^24; a naive `<` treats every frame after the
+                // wrap as "old" and drops it, permanently freezing ordered delivery (the ~30-min hang).
+                // A frame is behind only if it sits in the backward half of the 24-bit window.
+                if (frame.ordered_frame_index.wrapping_sub(self.last_ordered_index) & Self::ORDERED_INDEX_MASK)
+                    >= Self::ORDERED_INDEX_HALF
+                {
                     return Ok(());
                 }
 
@@ -621,7 +636,7 @@ impl RecvQ {
                 ret.push(frame);
                 self.ordered_packets.remove(&i);
                 //raknet_log!("{} : received ordered [{}]" , peer_addr ,self.last_ordered_index);
-                self.last_ordered_index = i + 1;
+                self.last_ordered_index = (i + 1) & Self::ORDERED_INDEX_MASK; // 24-bit wrap
                 self.last_ordered_advance_ms = now; // ordered delivery progressed — reset the stall timer
             }
         }
@@ -1079,6 +1094,30 @@ async fn test_recvq_ordered_time_stall_self_heal() {
     assert_eq!(r.flush(2000, &addr).len(), 0, "must not skip before the timeout");
     let ret = r.flush(11000, &addr); // >8s of no progress → skip
     assert_eq!(ret.len(), 4, "time-based self-heal must skip the stuck head and drain the backlog");
+}
+
+#[tokio::test]
+async fn test_recvq_ordered_index_24bit_wrap() {
+    // ordered_frame_index is 24-bit on the wire and wraps at 2^24. Delivery must survive the wrap
+    // (…16777215 → 0 → 1…). Without the modular comparison, the post-wrap frames are numerically smaller
+    // than last_ordered_index and get dropped as "old" — permanently freezing ordered delivery (the
+    // ~30-min hang that only a fresh connection/transfer cleared).
+    let mut r = RecvQ::new();
+    let addr = "0.0.0.0:0".parse().unwrap();
+    r.last_ordered_index = 0x00FF_FFFE; // parked right at the wrap boundary
+    let mk = |idx: u32, seq: u32| {
+        let mut p = FrameSetPacket::new(Reliability::ReliableOrdered, vec![]);
+        p.sequence_number = seq;
+        p.ordered_frame_index = idx;
+        p.reliable_frame_index = seq;
+        p
+    };
+    r.insert(mk(0x00FF_FFFE, 1)).unwrap();
+    r.insert(mk(0x00FF_FFFF, 2)).unwrap();
+    r.insert(mk(0x0000_0000, 3)).unwrap(); // wrapped — must NOT be dropped as stale
+    r.insert(mk(0x0000_0001, 4)).unwrap();
+    let n = r.flush(1000, &addr).len() + r.flush(1001, &addr).len();
+    assert_eq!(n, 4, "all frames across the 24-bit ordered-index wrap must deliver, not be dropped");
 }
 
 #[tokio::test]
