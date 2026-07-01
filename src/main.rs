@@ -321,9 +321,10 @@ async fn relay(
                 if last_down_fwd.elapsed().as_secs() >= 10 && last_up_fwd.elapsed().as_secs() < 8 {
                     let c = client.queue_stats();
                     let s = server.queue_stats();
+                    let down_starved = last_down_fwd.elapsed().as_secs();
                     tracing::warn!(
                         session_id,
-                        down_starved_s = last_down_fwd.elapsed().as_secs(),
+                        down_starved_s = down_starved,
                         up_age_s = last_up_fwd.elapsed().as_secs(),
                         client_recvq_ordered = c.0, client_recvq_frag = c.1, client_recvq_pending = c.2,
                         client_sendq_unacked = c.3, client_sendq_queued = c.4,
@@ -331,6 +332,15 @@ async fn relay(
                         server_sendq_unacked = s.3, server_sendq_queued = s.4,
                         "SESSION FROZEN: no downstream data reaching client while client is active — queue snapshot"
                     );
+                    // Last-resort recovery: downstream dead for 45s+ while the client is still actively
+                    // sending is a real stall, not an idle player. Whatever the cause (an ordered stall the
+                    // 8s self-heal somehow didn't clear, a send-side stall, a wedged backend session), force
+                    // a clean disconnect so the player relogs into a fresh session instead of a silent,
+                    // indefinite freeze. This guarantees no session stays frozen — the reported pathology.
+                    if down_starved >= 45 {
+                        tracing::error!(session_id, down_starved_s = down_starved, "SESSION FROZEN 45s — forcing reconnect to recover");
+                        break;
+                    }
                 }
             }
             cmd = ctl_rx.recv() => match cmd {
