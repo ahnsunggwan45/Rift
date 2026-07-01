@@ -454,6 +454,8 @@ pub struct RecvQ {
     /// sequence_number and were therefore delivered twice (bug).
     received_reliable: std::collections::HashSet<u32>,
     reliable_window: std::collections::VecDeque<u32>,
+    /// Timestamp (ms) ordered delivery last advanced — drives the time-based head-of-line self-heal.
+    last_ordered_advance_ms: i64,
 }
 
 impl RecvQ {
@@ -462,6 +464,12 @@ impl RecvQ {
     /// retransmit never fills it) and skip the gap instead of freezing forever. Set well above the
     /// normal loss-recovery reorder buffer (≈ receive-rate × RTO), so legitimate reordering never trips it.
     const ORDERED_STALL_LIMIT: usize = 1024;
+
+    /// Time-based counterpart: if ordered delivery makes no progress for this long while frames are queued
+    /// behind the head, the head frame is unfillable — skip it. Rate-independent, so it catches a
+    /// low-traffic stall (few queued frames) that the count limit above would never reach. Well beyond
+    /// normal retransmit recovery (a few RTOs), so healthy loss recovery never trips it.
+    const ORDERED_STALL_MS: i64 = 8000;
 
     pub fn new() -> Self {
         Self {
@@ -473,6 +481,7 @@ impl RecvQ {
             last_ordered_index: 0,
             received_reliable: std::collections::HashSet::new(),
             reliable_window: std::collections::VecDeque::new(),
+            last_ordered_advance_ms: 0,
         }
     }
 
@@ -571,24 +580,33 @@ impl RecvQ {
         self.sequence_number_ackset.get_nack()
     }
 
-    pub fn flush(&mut self, _peer_addr: &SocketAddr) -> Vec<FrameSetPacket> {
+    pub fn flush(&mut self, now: i64, _peer_addr: &SocketAddr) -> Vec<FrameSetPacket> {
         let mut ret = vec![];
 
-        // Self-heal a head-of-line stall: if the ordered frame at `last_ordered_index` is permanently
-        // missing, every later ordered frame queues behind it forever — ordered delivery freezes while
-        // the connection stays alive (the classic "connected but nothing works" hang). When the backlog
-        // grows past ORDERED_STALL_LIMIT the gap is treated as unfillable and skipped to the lowest queued
-        // index so delivery resumes. A brief ordering skip is far better than a permanently frozen session.
-        if self.ordered_packets.len() >= Self::ORDERED_STALL_LIMIT {
-            if let Some(&min_key) = self.ordered_packets.keys().min() {
-                if min_key > self.last_ordered_index {
-                    raknet_log_debug!(
-                        "ordered HoL stall: skipping index {}..{} ({} queued)",
-                        self.last_ordered_index,
-                        min_key,
-                        self.ordered_packets.len()
-                    );
-                    self.last_ordered_index = min_key;
+        // Head-of-line self-heal (see ORDERED_STALL_LIMIT / ORDERED_STALL_MS): if the ordered frame at
+        // `last_ordered_index` is permanently missing (ACKed-but-undelivered), every later ordered frame
+        // queues behind it forever and ordered delivery freezes while the connection stays alive (the
+        // "connected but nothing works" hang). Skip the gap to the lowest queued index when the backlog is
+        // pathologically large OR ordered delivery has made no progress for too long. The time bound is
+        // rate-independent, so it also catches a low-traffic stall that never reaches the count limit.
+        if !self.ordered_packets.is_empty() {
+            if self.last_ordered_advance_ms == 0 {
+                self.last_ordered_advance_ms = now; // start the stall timer on first backlog
+            }
+            let stalled_ms = now - self.last_ordered_advance_ms;
+            if self.ordered_packets.len() >= Self::ORDERED_STALL_LIMIT || stalled_ms >= Self::ORDERED_STALL_MS {
+                if let Some(&min_key) = self.ordered_packets.keys().min() {
+                    if min_key > self.last_ordered_index {
+                        raknet_log_debug!(
+                            "ordered HoL stall self-heal: skip index {}..{} ({} queued, stalled {}ms)",
+                            self.last_ordered_index,
+                            min_key,
+                            self.ordered_packets.len(),
+                            stalled_ms
+                        );
+                        self.last_ordered_index = min_key;
+                        self.last_ordered_advance_ms = now;
+                    }
                 }
             }
         }
@@ -604,6 +622,7 @@ impl RecvQ {
                 self.ordered_packets.remove(&i);
                 //raknet_log!("{} : received ordered [{}]" , peer_addr ,self.last_ordered_index);
                 self.last_ordered_index = i + 1;
+                self.last_ordered_advance_ms = now; // ordered delivery progressed — reset the stall timer
             }
         }
 
@@ -1000,7 +1019,7 @@ async fn test_recvq() {
     p.reliable_frame_index = 1;
     r.insert(p).unwrap();
 
-    let ret = r.flush(&"0.0.0.0:0".parse().unwrap());
+    let ret = r.flush(0, &"0.0.0.0:0".parse().unwrap());
     assert!(ret.len() == 2);
 }
 
@@ -1018,7 +1037,7 @@ async fn test_recvq_ordered_stall_self_heal() {
         p.reliable_frame_index = i;
         r.insert(p).unwrap();
     }
-    let ret = r.flush(&"0.0.0.0:0".parse().unwrap());
+    let ret = r.flush(0, &"0.0.0.0:0".parse().unwrap());
     assert_eq!(
         ret.len(),
         limit as usize,
@@ -1038,8 +1057,28 @@ async fn test_recvq_ordered_no_false_skip_under_limit() {
         p.reliable_frame_index = i;
         r.insert(p).unwrap();
     }
-    let ret = r.flush(&"0.0.0.0:0".parse().unwrap());
+    let ret = r.flush(0, &"0.0.0.0:0".parse().unwrap());
     assert_eq!(ret.len(), 0, "a small ordered gap must hold (no premature skip)");
+}
+
+#[tokio::test]
+async fn test_recvq_ordered_time_stall_self_heal() {
+    // Low-traffic stall: only a few ordered frames queued behind a missing index 0 — never reaches the
+    // count limit. The time-based self-heal must still skip the gap once ordered delivery has been stuck
+    // past ORDERED_STALL_MS. (now starts at 1000; 0 is the "timer not started" sentinel.)
+    let mut r = RecvQ::new();
+    for i in 1..5u32 {
+        let mut p = FrameSetPacket::new(Reliability::ReliableOrdered, vec![]);
+        p.sequence_number = i;
+        p.ordered_frame_index = i;
+        p.reliable_frame_index = i;
+        r.insert(p).unwrap();
+    }
+    let addr = "0.0.0.0:0".parse().unwrap();
+    assert_eq!(r.flush(1000, &addr).len(), 0, "small gap holds at first (timer starts)");
+    assert_eq!(r.flush(2000, &addr).len(), 0, "must not skip before the timeout");
+    let ret = r.flush(11000, &addr); // >8s of no progress → skip
+    assert_eq!(ret.len(), 4, "time-based self-heal must skip the stuck head and drain the backlog");
 }
 
 #[tokio::test]
@@ -1075,7 +1114,7 @@ async fn test_recvq_fragment() {
     p.reliable_frame_index = 2;
     r.insert(p).unwrap();
 
-    let ret = r.flush(&"0.0.0.0:0".parse().unwrap());
+    let ret = r.flush(0, &"0.0.0.0:0".parse().unwrap());
     assert!(ret.len() == 1);
     assert!(ret[0].data == vec![1, 2, 3]);
 }
@@ -1408,7 +1447,7 @@ async fn test_client_packet2() {
         let v = FrameVec::new(i.clone()).unwrap();
         for i in v.frames {
             rq.insert(i).unwrap();
-            if !rq.flush(&"0.0.0.0:0".parse().unwrap()).is_empty() {
+            if !rq.flush(0, &"0.0.0.0:0".parse().unwrap()).is_empty() {
                 n += 1;
             }
         }

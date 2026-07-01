@@ -450,7 +450,7 @@ impl RaknetSocket {
             loop {
                 if connected.is_closed() {
                     let mut recvq = recvq.lock().await;
-                    for f in recvq.flush(&peer_addr) {
+                    for f in recvq.flush(cur_timestamp_millis(), &peer_addr) {
                         // shutdown flush — ignore handle errors (connection is closing anyway).
                         let _ = RaknetSocket::handle(
                             f,
@@ -534,7 +534,7 @@ impl RaknetSocket {
                     for frame in frames.frames {
                         let _ = recvq.insert(frame);
 
-                        for f in recvq.flush(&peer_addr) {
+                        for f in recvq.flush(cur_timestamp_millis(), &peer_addr) {
                             match RaknetSocket::handle(
                                 f,
                                 &peer_addr,
