@@ -303,6 +303,8 @@ async fn relay(
     // reaching the client while the client is still sending (a silent freeze), dump the RakNet queue depths.
     let mut last_down_fwd = std::time::Instant::now();
     let mut last_up_fwd = std::time::Instant::now();
+    // One seamless auto-recovery attempt per freeze episode (reset once downstream flows again).
+    let mut auto_recovered = false;
 
     loop {
         let mut transfer_to: Option<String> = None;
@@ -332,14 +334,21 @@ async fn relay(
                         server_sendq_unacked = s.3, server_sendq_queued = s.4,
                         "SESSION FROZEN: no downstream data reaching client while client is active — queue snapshot"
                     );
-                    // Last-resort recovery: downstream dead for 45s+ while the client is still actively
-                    // sending is a real stall, not an idle player. Whatever the cause (an ordered stall the
-                    // 8s self-heal somehow didn't clear, a send-side stall, a wedged backend session), force
-                    // a clean disconnect so the player relogs into a fresh session instead of a silent,
-                    // indefinite freeze. This guarantees no session stays frozen — the reported pathology.
+                    // Recovery: downstream dead for 45s+ while the client is still actively sending is a real
+                    // stall, not an idle player. The user confirmed a console transfer un-sticks it (a fresh
+                    // proxy↔backend connection), so first automate exactly that — re-transfer to the *current*
+                    // server (seamless; the client connection is preserved). If that doesn't take (e.g. the
+                    // backend rejects the duplicate login → Ok(false), still frozen), force a clean disconnect
+                    // on the next check so the player relogs. Either way no session stays frozen indefinitely.
                     if down_starved >= 45 {
-                        tracing::error!(session_id, down_starved_s = down_starved, "SESSION FROZEN 45s — forcing reconnect to recover");
-                        break;
+                        if !auto_recovered {
+                            auto_recovered = true;
+                            tracing::error!(session_id, down_starved_s = down_starved, %current_server, "SESSION FROZEN 45s — auto-reconnecting backend (re-transfer to current server)");
+                            transfer_to = Some(current_server.clone());
+                        } else {
+                            tracing::error!(session_id, down_starved_s = down_starved, "SESSION FROZEN — auto-reconnect did not restore flow, forcing disconnect");
+                            break;
+                        }
                     }
                 }
             }
@@ -386,6 +395,7 @@ async fn relay(
                 Ok(data) => {
                     health.set_stage(registry::stage::INTERCEPT_DOWN);
                     last_down_fwd = std::time::Instant::now();
+                    auto_recovered = false; // downstream is flowing again — re-arm auto-recovery
                     let fwd_t0 = std::time::Instant::now();
                     metrics.on_bytes_down(data.len());
                     match intercept::intercept_down(&mut state, &data, force_vv, channel_transfer, max_decode, packs.as_deref()) {
