@@ -53,6 +53,13 @@ pub struct Health {
     pub stage: AtomicU8,
     /// Incremented once per relay loop iteration — proves the loop is still progressing.
     pub loop_beat: AtomicU64,
+    /// Backend-connection reliability diagnostics (sampled periodically) — for the dashboard/console so a
+    /// stall is visible before it becomes a freeze. `srv_ordered_index` should climb and wrap past 2^24
+    /// without sticking; a rising `srv_ordered_dropped` while frozen is the ordered-index-wrap signature.
+    pub srv_ordered_index: AtomicU64,
+    pub srv_ordered_backlog: AtomicU64,
+    pub srv_ordered_dropped: AtomicU64,
+    pub srv_sendq_unacked: AtomicU64,
 }
 
 impl Health {
@@ -65,6 +72,13 @@ impl Health {
     #[inline]
     pub fn beat(&self) {
         self.loop_beat.fetch_add(1, Relaxed);
+    }
+    /// Sample the backend connection's reliability state (called periodically from the relay).
+    pub fn set_diag(&self, ordered_index: u32, backlog: usize, dropped: u64, sendq_unacked: usize) {
+        self.srv_ordered_index.store(ordered_index as u64, Relaxed);
+        self.srv_ordered_backlog.store(backlog as u64, Relaxed);
+        self.srv_ordered_dropped.store(dropped, Relaxed);
+        self.srv_sendq_unacked.store(sendq_unacked as u64, Relaxed);
     }
 }
 
@@ -100,6 +114,12 @@ pub struct SessionInfo {
     pub connected_secs: u64,
     /// Estimated client↔proxy RTT in ms (SRTT).
     pub rtt_ms: u32,
+    /// Backend-connection reliability diagnostics (sampled ~every 3s). `ordered_index` should keep
+    /// advancing (and wrap past 2^24) — a stuck value or rising `ordered_dropped` signals a stall.
+    pub ordered_index: u64,
+    pub ordered_backlog: u64,
+    pub ordered_dropped: u64,
+    pub sendq_unacked: u64,
 }
 
 #[derive(Default)]
@@ -187,6 +207,10 @@ impl Registry {
                         server: e.server.clone(),
                         connected_secs: e.connected.elapsed().as_secs(),
                         rtt_ms: e.rtt_ms,
+                        ordered_index: e.health.srv_ordered_index.load(Relaxed),
+                        ordered_backlog: e.health.srv_ordered_backlog.load(Relaxed),
+                        ordered_dropped: e.health.srv_ordered_dropped.load(Relaxed),
+                        sendq_unacked: e.health.srv_sendq_unacked.load(Relaxed),
                     })
                     .collect()
             })

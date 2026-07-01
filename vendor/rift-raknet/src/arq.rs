@@ -456,6 +456,10 @@ pub struct RecvQ {
     reliable_window: std::collections::VecDeque<u32>,
     /// Timestamp (ms) ordered delivery last advanced — drives the time-based head-of-line self-heal.
     last_ordered_advance_ms: i64,
+    /// Diagnostics: ordered frames delivered, and ordered frames dropped as "already delivered" (behind).
+    /// A climbing `dropped_behind` while the game is frozen is the signature of an ordered-index bug.
+    ordered_delivered: u64,
+    ordered_dropped_behind: u64,
 }
 
 impl RecvQ {
@@ -492,7 +496,20 @@ impl RecvQ {
             received_reliable: std::collections::HashSet::new(),
             reliable_window: std::collections::VecDeque::new(),
             last_ordered_advance_ms: 0,
+            ordered_delivered: 0,
+            ordered_dropped_behind: 0,
         }
+    }
+
+    /// Diagnostics: next-expected ordered index, ordered frames delivered, ordered frames dropped as behind.
+    pub fn ordered_index(&self) -> u32 {
+        self.last_ordered_index
+    }
+    pub fn ordered_delivered(&self) -> u64 {
+        self.ordered_delivered
+    }
+    pub fn ordered_dropped_behind(&self) -> u64 {
+        self.ordered_dropped_behind
     }
 
     pub fn insert(&mut self, frame: FrameSetPacket) -> Result<()> {
@@ -554,6 +571,7 @@ impl RecvQ {
                 if (frame.ordered_frame_index.wrapping_sub(self.last_ordered_index) & Self::ORDERED_INDEX_MASK)
                     >= Self::ORDERED_INDEX_HALF
                 {
+                    self.ordered_dropped_behind += 1;
                     return Ok(());
                 }
 
@@ -638,6 +656,7 @@ impl RecvQ {
                 //raknet_log!("{} : received ordered [{}]" , peer_addr ,self.last_ordered_index);
                 self.last_ordered_index = (i + 1) & Self::ORDERED_INDEX_MASK; // 24-bit wrap
                 self.last_ordered_advance_ms = now; // ordered delivery progressed — reset the stall timer
+                self.ordered_delivered += 1;
             }
         }
 
