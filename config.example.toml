@@ -46,6 +46,10 @@ log_interval_secs = 0          # >0 logs throughput and player count periodicall
 # Performance data collection: when enabled, appends a metrics snapshot as JSONL every N seconds for offline analysis.
 # history_file = "metrics.jsonl"
 # history_interval_secs = 10
+# Diagnostic console stream: >0 prints each session's backend reliability state (ordered index, recv backlog,
+# dropped-behind, sendq depth, rtt) to the console every N seconds — a live feed to watch a stall form/hit
+# while reproducing a freeze. 0 = off. Set to 2 while debugging.
+# diag_log_secs = 2
 
 # Downstream channels. Key = channel name (transfer target), address = backend server address (hostnames supported).
 [servers]

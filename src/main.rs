@@ -170,6 +170,35 @@ async fn run(cfg: Arc<Config>) -> Result<()> {
     // Console commands (stdin). Exits silently on EOF when running in the background.
     console::spawn(registry.clone(), metrics.clone(), shutdown.clone());
 
+    // Diagnostic stream: if [metrics] diag_log_secs > 0, print every session's backend-connection reliability
+    // state to the console on a fixed interval — a live feed to watch a stall form/hit while reproducing a
+    // freeze (ordered_idx should keep climbing and wrap past 16,777,216; recvq_backlog/ordered_dropped/
+    // sendq_unacked should stay 0). Off in production.
+    if cfg.metrics.diag_log_secs > 0 {
+        let reg = registry.clone();
+        let secs = cfg.metrics.diag_log_secs.max(1);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(secs));
+            loop {
+                tick.tick().await;
+                for s in reg.snapshot() {
+                    tracing::info!(
+                        session = s.id,
+                        name = ?s.name,
+                        server = %s.server,
+                        rtt_ms = s.rtt_ms,
+                        conn_s = s.connected_secs,
+                        ordered_idx = s.ordered_index,
+                        recvq_backlog = s.ordered_backlog,
+                        ordered_dropped = s.ordered_dropped,
+                        sendq_unacked = s.sendq_unacked,
+                        "diag"
+                    );
+                }
+            }
+        });
+    }
+
     // Stall watchdog: logs any session whose relay loop stops progressing (a proxy-side hang), with the
     // stage it was stuck in — so an in-the-wild freeze is localized (stage=intercept_down ⇒ decompression,
     // send_client ⇒ RakNet send window, idle ⇒ no inbound packets). Silent unless a stall occurs.

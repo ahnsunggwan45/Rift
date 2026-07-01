@@ -56,6 +56,11 @@ pub struct MetricsCfg {
     /// History recording interval in seconds. 0 or unset defaults to 10.
     #[serde(default)]
     pub history_interval_secs: u64,
+    /// Diagnostic mode: if > 0, print each session's reliability state (ordered index, recv backlog,
+    /// dropped-behind, sendq depth, rtt) to the console every N seconds — a live stream to watch a stall
+    /// form/hit. 0 = off (production). Set to e.g. 2 while debugging a freeze.
+    #[serde(default)]
+    pub diag_log_secs: u64,
 }
 
 /// Proxy resource-pack serving configuration (WDPE-style replace — the proxy serves packs from `packs/`
