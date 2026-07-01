@@ -959,6 +959,25 @@ impl RaknetSocket {
         }
     }
 
+    /// Diagnostic snapshot of the reliability queue depths, for stall detection:
+    /// `(recvq_ordered_backlog, recvq_incomplete_compounds, recvq_pending, sendq_unacked, sendq_queued)`.
+    /// A deep recvq_ordered/compounds backlog means ordered delivery is head-of-line stalled; a deep
+    /// sendq_unacked means the peer has stopped ACKing; all-zero while data should be flowing points
+    /// upstream (the other side stopped sending). Uses **non-blocking** try-locks so the caller can never
+    /// be stalled by this diagnostic — a field of `usize::MAX` means that lock was held (itself a signal:
+    /// the recv task is holding recvq, e.g. blocked on the user-data channel).
+    pub fn queue_stats(&self) -> (usize, usize, usize, usize, usize) {
+        let (ordered, frags, pending) = match self.recvq.try_lock() {
+            Ok(rq) => (rq.get_ordered_packet(), rq.get_fragment_queue_size(), rq.get_size()),
+            Err(_) => (usize::MAX, usize::MAX, usize::MAX),
+        };
+        let (unacked, queued) = match self.sendq.try_read() {
+            Ok(sq) => (sq.get_sent_queue_size(), sq.get_reliable_queue_size()),
+            Err(_) => (usize::MAX, usize::MAX),
+        };
+        (ordered, frags, pending, unacked, queued)
+    }
+
     /// Returns the socket address of the remote peer of this Raknet connection.
     ///
     /// # Example

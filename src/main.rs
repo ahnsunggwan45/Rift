@@ -299,6 +299,10 @@ async fn relay(
     let mut identity_set = false;
     // Periodically update the client↔proxy RTT (ping) in the registry for web/console display.
     let mut rtt_tick = tokio::time::interval(std::time::Duration::from_secs(3));
+    // Frozen-session detection: track when data last actually flowed each way. If downstream data stops
+    // reaching the client while the client is still sending (a silent freeze), dump the RakNet queue depths.
+    let mut last_down_fwd = std::time::Instant::now();
+    let mut last_up_fwd = std::time::Instant::now();
 
     loop {
         let mut transfer_to: Option<String> = None;
@@ -310,6 +314,24 @@ async fn relay(
                 health.set_stage(registry::stage::RTT);
                 let rtt = client.rtt().await;
                 registry.set_rtt(session_id, rtt.max(0) as u32);
+                // Silent-freeze detector: downstream data has stopped reaching the client for a while, yet the
+                // client is still actively sending. Dump the RakNet queue depths so the stalled layer shows up
+                // (server_recvq_* deep = backend→proxy ordered/fragment stall; client_sendq_* deep = client not
+                // ACKing; all ~0 = backend stopped sending; usize::MAX = that lock was held).
+                if last_down_fwd.elapsed().as_secs() >= 10 && last_up_fwd.elapsed().as_secs() < 8 {
+                    let c = client.queue_stats();
+                    let s = server.queue_stats();
+                    tracing::warn!(
+                        session_id,
+                        down_starved_s = last_down_fwd.elapsed().as_secs(),
+                        up_age_s = last_up_fwd.elapsed().as_secs(),
+                        client_recvq_ordered = c.0, client_recvq_frag = c.1, client_recvq_pending = c.2,
+                        client_sendq_unacked = c.3, client_sendq_queued = c.4,
+                        server_recvq_ordered = s.0, server_recvq_frag = s.1, server_recvq_pending = s.2,
+                        server_sendq_unacked = s.3, server_sendq_queued = s.4,
+                        "SESSION FROZEN: no downstream data reaching client while client is active — queue snapshot"
+                    );
+                }
             }
             cmd = ctl_rx.recv() => match cmd {
                 Some(registry::Control::Transfer(t)) => {
@@ -325,6 +347,7 @@ async fn relay(
             up = client.recv() => match up {
                 Ok(data) => {
                     health.set_stage(registry::stage::INTERCEPT_UP);
+                    last_up_fwd = std::time::Instant::now();
                     metrics.on_bytes_up(data.len());
                     match intercept::intercept_up(&mut state, &data, packs.as_deref()) {
                         Outcome::Forward => {
@@ -352,6 +375,7 @@ async fn relay(
             down = server.recv() => match down {
                 Ok(data) => {
                     health.set_stage(registry::stage::INTERCEPT_DOWN);
+                    last_down_fwd = std::time::Instant::now();
                     let fwd_t0 = std::time::Instant::now();
                     metrics.on_bytes_down(data.len());
                     match intercept::intercept_down(&mut state, &data, force_vv, channel_transfer, max_decode, packs.as_deref()) {
